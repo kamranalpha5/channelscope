@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ChannelScope — YouTube Competitor Map</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="logo"><span class="radar-dot"></span> ChannelScope</div>
+  <nav class="pillnav">
+    <a href="#topics">Topics</a>
+    <a href="#map">Map</a>
+    <a href="#breakouts">Breakouts</a>
+    <a href="#mapchat">Map chat</a>
+    <a href="#results">Results</a>
+  </nav>
+  <button class="btn small" id="keyBtn">🔑 API Key</button>
+</header>
+
+<main>
+  <!-- HERO -->
+  <section class="hero">
+    <div class="hero-radar" aria-hidden="true"><div class="sweep"></div><div class="ring r1"></div><div class="ring r2"></div><div class="ring r3"></div></div>
+    <h1>Dominate your niche.</h1>
+    <p class="sub">Map the channels YouTube recommends around yours, spot who's breaking out, and see what to make next — in your channel's style.</p>
+
+    <div class="builder card" id="builder">
+      <label>Seed channel</label>
+      <div class="row">
+        <input id="seedInput" type="text" placeholder="@EconomyPuzzle  ya  youtube.com/@handle  ya  channel ID" autocomplete="off">
+        <button class="btn primary" id="buildBtn">Build map</button>
+      </div>
+      <div class="row depth-row">
+        <span>Depth</span>
+        <input type="range" id="depthSlider" min="1" max="3" step="1" value="2">
+        <span id="depthLabel" class="depth-label">Depth 2 · up to ~70 channels</span>
+      </div>
+      <p class="hint">Depth 1 ≈ 16 channels · Depth 2 ≈ 70 · Depth 4 ≈ 273. Niche is derived from YOUR seed channel — never hardcoded.</p>
+      <div id="buildStatus" class="status"></div>
+      <div id="progress" class="progress hidden"><div class="bar" id="progressBar"></div><span id="progressText"></span></div>
+      <div id="keyWarn" class="warn hidden">⚠️ API key saved nahi hai — pehle <button class="linklike" id="keyWarnBtn">Settings mein key daalo</button>.</div>
+    </div>
+
+    <div class="quotabar card" id="quotaBar">Quota: <b id="quotaUsed">–</b> / 10,000 units today · Search = 100 units · most other calls = 1</div>
+  </section>
+
+  <!-- API KEY SETUP -->
+  <section class="card section" id="keySection">
+    <h2>API key setup</h2>
+    <p>Apni <b>YouTube Data API v3 key</b> yahan paste karo. Key sirf is PC par save hoti hai (data/settings.json) — kahin aur nahi bheji jati. Key banane ke liye: Google Cloud Console → YouTube Data API v3 Enable → Credentials → Create API key → sirf YouTube Data API v3 par restrict karo.</p>
+    <div class="row">
+      <input id="apiKeyInput" type="password" placeholder="AIzaSy... (apni key yahan paste karo)" autocomplete="off">
+      <button class="btn primary" id="saveKeyBtn">Save key</button>
+      <button class="btn danger hidden" id="removeKeyBtn">Remove key</button>
+    </div>
+    <div id="keyStatus" class="status"></div>
+  </section>
+
+  <!-- MAP -->
+  <section class="section" id="map">
+    <h2>Map <span id="mapBadge" class="badge hidden">Building…</span></h2>
+    <div id="nicheChips" class="chips"></div>
+    <div class="card map-wrap">
+      <div id="mapEmpty" class="empty">Abhi koi map nahi hai.<br>Upar seed channel likho aur <b>Build map</b> dabao — seed ~1 second mein dikhega, phir rings bharte jayenge.</div>
+      <svg id="mapSvg" viewBox="0 0 900 600" class="hidden" role="img" aria-label="Channel map"></svg>
+      <div id="hoverCard" class="hover-card hidden"></div>
+    </div>
+    <div class="row center"><button class="btn hidden" id="continueBtn">Continue building</button></div>
+    <div id="channelDetail" class="card hidden"></div>
+  </section>
+
+  <!-- BREAKOUTS -->
+  <section class="section" id="breakouts">
+    <h2>Breakouts</h2>
+    <p class="sub2">Every video punching above its own channel's median.</p>
+    <div class="row">
+      <label>Minimum breakout</label>
+      <select id="minBreakout"><option value="2">2×</option><option value="3" selected>3×</option><option value="5">5×</option><option value="10">10×</option><option value="20">20×</option></select>
+      <span id="breakoutCount" class="muted"></span>
+    </div>
+    <div id="breakoutList" class="list"></div>
+  </section>
+
+  <!-- TOPICS -->
+  <section class="section" id="topics">
+    <h2>Topics</h2>
+    <p class="sub2">Data-driven suggestions from your map's own breakout videos — no AI key needed.</p>
+    <div id="topicList" class="topics"></div>
+  </section>
+
+  <!-- MAP CHAT -->
+  <section class="section" id="mapchat">
+    <h2>Map chat</h2>
+    <p class="sub2">Ask anything about your map — answers come only from your own mapped data.</p>
+    <div class="row">
+      <input id="chatInput" type="text" placeholder="e.g. which channels talk about inflation?">
+      <button class="btn primary" id="chatBtn">Ask</button>
+    </div>
+    <div class="row" style="margin-top:8px">
+      <button class="btn small" id="chatSuggestChip">💡 Analyze my channel and suggest my next video topic</button>
+    </div>
+    <div id="chatAnswer" class="card hidden"></div>
+  </section>
+
+  <!-- RESULTS -->
+  <section class="section" id="results">
+    <h2>Results</h2>
+    <div id="resultsGrid" class="results-grid"></div>
+  </section>
+
+  <footer>ChannelScope (standalone) · Your key stays on your PC · YouTube data via YouTube Data API v3 · Not affiliated with YouTube or Google.</footer>
+</main>
+
+<!-- SCRIPT MODAL -->
+<div id="scriptModal" class="modal hidden">
+  <div class="modal-box">
+    <div class="row space"><h3 id="scriptTitle">Replicated script</h3><button class="btn small" id="scriptClose">✕</button></div>
+    <p class="muted" id="scriptMeta"></p>
+    <pre id="scriptBody"></pre>
+    <div class="row"><button class="btn primary" id="scriptCopy">Copy script</button><button class="btn" id="scriptDownload">Download .md</button></div>
+  </div>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>
