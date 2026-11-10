@@ -3,7 +3,11 @@ const $ = s => document.querySelector(s);
 let currentMapId = null;
 let currentMap = null;
 let hasKey = false;
-let expanding = false;
+let expandingFor = null; // which map id an expand loop is currently working on
+let mapsList = [];
+let trendingData = null;
+let trendingPage = 0;
+const TRENDING_PAGE_SIZE = 10;
 
 async function api(path, opts) {
   const r = await fetch(path, Object.assign({ headers: { 'Content-Type': 'application/json' } }, opts || {}));
@@ -85,6 +89,8 @@ $('#buildBtn').onclick = async () => {
     currentMapId = r.map.id;
     currentMap = r.map;
     renderMap();
+    loadMapList();
+    prefillTrendingNiche();
     setStatus($('#buildStatus'), 'Seed mil gaya — rings bhar rahe hain…', 'ok');
     await expandLoop();
     loadResults();
@@ -94,35 +100,152 @@ $('#buildBtn').onclick = async () => {
   }
 };
 
+function prefillTrendingNiche() {
+  const tn = $('#trendingNiche');
+  if (tn && !tn.value && currentMap && currentMap.nicheKeywords) tn.value = currentMap.nicheKeywords.join(' ');
+}
+
 async function expandLoop() {
-  if (expanding || !currentMapId) return;
-  expanding = true;
+  if (!currentMapId) return;
+  // A loop for THIS map is already running — do not start a second one.
+  if (expandingFor === currentMapId) return;
+  // A loop for ANOTHER map may still be running: it exits on its own once it
+  // notices currentMapId changed (checked after every expand response), so
+  // starting this map's loop is safe — the old one never touches this map.
+  expandingFor = currentMapId;
+  const myMapId = currentMapId;
   $('#mapBadge').classList.remove('hidden');
   $('#continueBtn').classList.add('hidden');
+  hideStall();
   try {
-    while (currentMap && currentMap.status === 'building') {
+    while (currentMap && currentMap.status === 'building' && currentMapId === myMapId) {
       const total = currentMap.depth;
       const done = currentMap.builtDepth;
       $('#progressText').textContent = `Depth ${done} of ${total} ready — ${currentMap.channels.length} channels`;
       $('#progressBar').style.width = Math.round((done / total) * 100) + '%';
-      const r = await api(`/api/maps/${currentMapId}/expand`, { method: 'POST', body: '{}' });
+      const r = await api(`/api/maps/${myMapId}/expand`, { method: 'POST', body: '{}' });
+      // STALE-LOOP GUARD: if the user started/switched to another map while
+      // this expand was in flight, do NOT apply its result to the new map.
+      if (currentMapId !== myMapId) return;
       currentMap = r.map;
+      if (r.stalled) {
+        renderMap(); loadMapList();
+        showStall(r.map);
+        setStatus($('#buildStatus'), r.message, 'err');
+        $('#mapBadge').classList.add('hidden');
+        return;
+      }
       renderMap();
       setStatus($('#buildStatus'), r.message, 'ok');
       if (r.done) break;
     }
+    if (currentMapId !== myMapId) return;
     $('#progressBar').style.width = '100%';
     $('#progressText').textContent = `Complete — ${currentMap.channels.length} channels`;
     $('#mapBadge').classList.add('hidden');
     $('#continueBtn').classList.add('hidden');
-    renderBreakouts(); renderTopics();
+    renderBreakouts(); renderTopics(); loadMapList(); loadResults();
   } catch (e) {
+    if (currentMapId !== myMapId) return;
     setStatus($('#buildStatus'), 'Build ruk gaya: ' + e.message + ' — Continue building dabao.', 'err');
     $('#continueBtn').classList.remove('hidden');
     $('#mapBadge').classList.add('hidden');
-  } finally { expanding = false; }
+  } finally {
+    if (expandingFor === myMapId) expandingFor = null;
+  }
 }
 $('#continueBtn').onclick = () => expandLoop();
+
+// ---------- zero-neighbour stall notice ----------
+function showStall(map) {
+  const box = $('#stallNotice');
+  const s = map.stall;
+  if (!s) { box.classList.add('hidden'); return; }
+  box.innerHTML = `<b>⚠️ Is ring mein 0 neighbours mile.</b>
+    <p>Niche keywords: <b>${(s.keywords || []).join(', ') || '—'}</b></p>
+    <p>Candidates mile: ${s.candidatesFound} · niche test pass: ${s.vettedPassed} · searches OK: ${s.searchesOk} · failed: ${s.searchesFailed} · quota used: ${fmt(s.quotaUsed)}</p>
+    <p class="muted">Wajah aksar: niche keywords bahut generic hain, ya YouTube searches fail ho gayi (quota). Dobara try karo — ya koi aur seed channel try karo.</p>
+    <div class="row"><button class="btn primary" id="stallRetryBtn">Try again</button><button class="btn" id="stallDismissBtn">Dismiss</button></div>`;
+  box.classList.remove('hidden');
+  $('#stallRetryBtn').onclick = async () => {
+    box.classList.add('hidden');
+    if (!currentMapId) return;
+    setStatus($('#buildStatus'), 'Ring dobara try ho rahi hai…');
+    await expandLoop();
+  };
+  $('#stallDismissBtn').onclick = () => box.classList.add('hidden');
+}
+function hideStall() { const b = $('#stallNotice'); if (b) b.classList.add('hidden'); }
+
+// ---------- map switcher (all built maps) ----------
+async function loadMapList() {
+  const wrap = $('#mapList');
+  try {
+    const r = await api('/api/maps');
+    mapsList = (r.maps || []).slice().sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0));
+    if (!mapsList.length) {
+      wrap.innerHTML = '<p class="muted">Abhi koi map nahi bana — upar seed channel likho aur Build map dabao.</p>';
+      $('#clearMapsBtn').classList.add('hidden');
+      return;
+    }
+    $('#clearMapsBtn').classList.remove('hidden');
+    wrap.innerHTML = mapsList.map(m => `
+      <div class="map-item${m.id === currentMapId ? ' selected' : ''}">
+        <img class="dp" src="${thumbUrl(m.seedThumbnail)}" onerror="imgFallback(this,'${escAttr(m.seedTitle)}')">
+        <div class="grow"><div class="t">${m.seedTitle}</div>
+        <div class="m">Depth ${m.depth} · ${m.channelCount} channels · ${m.status}${m.stall ? ' · stalled' : ''} · ${ago(m.createdAt)}</div></div>
+        <button class="btn small" data-open="${m.id}">Open</button>
+        <button class="btn small danger" data-del="${m.id}" title="Delete map">✕</button>
+      </div>`).join('');
+    wrap.querySelectorAll('[data-open]').forEach(b => b.onclick = () => loadMap(b.dataset.open));
+    wrap.querySelectorAll('[data-del]').forEach(b => b.onclick = async () => {
+      const delId = b.dataset.del;
+      if (!confirm('Ye map delete kar dun?')) return;
+      await api('/api/maps/' + delId, { method: 'DELETE' });
+      const wasCurrent = delId === currentMapId;
+      if (wasCurrent) { currentMapId = null; currentMap = null; }
+      await loadMapList(); loadResults();
+      if (wasCurrent) {
+        if (mapsList.length) await loadMap(mapsList[0].id);
+        else { renderMap(); renderBreakouts(); renderTopics(); }
+      }
+    });
+  } catch (e) { wrap.innerHTML = `<p class="status err">${e.message}</p>`; }
+}
+$('#clearMapsBtn').onclick = async () => {
+  if (!mapsList.length || !confirm(`Saare ${mapsList.length} maps delete kar dun?`)) return;
+  await api('/api/maps', { method: 'DELETE' });
+  currentMapId = null; currentMap = null;
+  await loadMapList(); loadResults();
+  renderMap(); renderBreakouts(); renderTopics();
+};
+
+async function loadMap(id) {
+  try {
+    const full = await api('/api/maps/' + id);
+    currentMapId = full.map.id;
+    currentMap = full.map;
+    hideStall();
+    renderMap(); renderBreakouts(); renderTopics(); loadMapList();
+    prefillTrendingNiche();
+    const p = $('#progress');
+    if (currentMap.status === 'building') {
+      setStatus($('#buildStatus'), 'Map adhoora hai — Continue building se resume karo.', 'ok');
+      $('#continueBtn').classList.remove('hidden');
+      p.classList.remove('hidden');
+      $('#progressText').textContent = `Depth ${currentMap.builtDepth} of ${currentMap.depth} ready — ${currentMap.channels.length} channels`;
+    } else if (currentMap.status === 'stalled') {
+      setStatus($('#buildStatus'), 'Ye map stall ho gaya tha — Try again se dobara try karo.', 'err');
+      showStall(currentMap);
+      $('#continueBtn').classList.remove('hidden');
+    } else {
+      $('#continueBtn').classList.add('hidden');
+      p.classList.add('hidden');
+      setStatus($('#buildStatus'), `Map loaded: ${currentMap.seedTitle} — ${currentMap.channels.length} channels.`, 'ok');
+    }
+    $('#channelDetail').classList.add('hidden');
+  } catch (e) { setStatus($('#buildStatus'), e.message, 'err'); }
+}
 
 // ---------- map render (inline SVG, real DPs) ----------
 function renderMap() {
@@ -205,7 +328,10 @@ async function showChannelDetail(channelId) {
   try {
     const r = await api(`/api/maps/${currentMapId}/channels/${channelId}`);
     const b = r.breakdown, ch = b.channel;
-    const top = b.topVideos.map(v => `<div class="bitem"><img class="thumb" src="${thumbUrl(v.thumbnail)}" onerror="thumbFallback(this)"><div class="grow"><div class="t">${v.title}</div><div class="m">${fmt(v.views)} views · ${v.multipleVsMedian}× median · ${ago(v.publishedAt)}</div></div><span class="badge-amber">${v.multipleVsMedian}×</span><button class="btn small" onclick="replicateVideo('${v.id}','${v.title.replace(/'/g, '')}')">Replicate script</button></div>`).join('');
+    // Full loaded-videos list (views desc): every video with outlier
+    // multiple, published date and views — from map nodes AND Breakouts.
+    const vids = (b.videos && b.videos.length ? b.videos : b.topVideos);
+    const top = vids.map(v => `<div class="bitem"><img class="thumb" src="${thumbUrl(v.thumbnail)}" onerror="thumbFallback(this)"><div class="grow"><div class="t">${v.title}</div><div class="m">${fmt(v.views)} views · ${v.multipleVsMedian}× median · ${ago(v.publishedAt)} · ${v.duration}</div></div><span class="badge-amber">${v.multipleVsMedian}×</span><button class="btn small" onclick="replicateVideo('${v.id}','${v.title.replace(/'/g, '')}')">Replicate script</button></div>`).join('');
     panel.innerHTML = `
       <div class="row"><img src="${thumbUrl(ch.thumbnail)}" onerror="imgFallback(this,'${escAttr(ch.title)}')" style="width:56px;height:56px;border-radius:50%">
       <div><h3 style="margin:0">${ch.title}</h3><p class="muted" style="margin:2px 0">${ch.customUrl || ''} · ${ch.country || ''} · since ${ch.publishedAt ? ch.publishedAt.slice(0, 10) : ''}</p></div>
@@ -222,7 +348,7 @@ async function showChannelDetail(channelId) {
       <p class="muted">Format: ${b.core_engine.format} · Hook: ${b.core_engine.hookStyle} · Pacing: ${b.core_engine.pacing}<br>
       Retention: ${b.core_engine.retentionDevices.join(', ')}<br>${b.core_engine.packagingNotes}</p>
       <h4>Top videos</h4>${top || '<p class="muted">No videos loaded for this channel.</p>'}
-      <p class="muted" style="font-size:12px">${b.note}</p>`;
+      <p class="muted" style="font-size:12px">Videos list: ${vids.length} loaded video(s), views ke hisaab se sorted. ${b.note}</p>`;
   } catch (e) { panel.innerHTML = `<p class="status err">${e.message}</p>`; }
 }
 
@@ -232,13 +358,14 @@ async function renderBreakouts() {
   const min = $('#minBreakout').value;
   try {
     const r = await api(`/api/maps/${currentMapId}/breakouts?min=${min}`);
-    $('#breakoutCount').textContent = r.count + ' videos ≥ ' + min + '×';
+    $('#breakoutCount').textContent = r.count + ' videos ≥ ' + min + '× · ' + (r.mapSeed || '') + (r.excludedLowMedian ? ` · ${r.excludedLowMedian} channel(s) skipped (median < 100)` : '');
     $('#breakoutList').innerHTML = r.breakouts.length ? r.breakouts.map(b => `
       <div class="bitem">
         <img class="thumb" src="${thumbUrl(b.thumbnail)}" onerror="thumbFallback(this)">
         <img class="dp" src="${thumbUrl(b.channelThumbnail)}" onerror="imgFallback(this,'${escAttr(b.channelTitle)}')">
-        <div class="grow"><div class="t">${b.title}</div><div class="m">${b.channelTitle} · ${fmt(b.views)} views · ${ago(b.publishedAt)} · ${b.duration}</div></div>
+        <div class="grow"><div class="t">${b.title}</div><div class="m">${b.channelTitle} · ${fmt(b.views)} views · channel median ${fmt(b.channelMedian)} · ${ago(b.publishedAt)} · ${b.duration}</div></div>
         <span class="badge-amber">${b.multiple}×</span>
+        <button class="btn small" onclick="showChannelDetail('${b.channelId}')">Open</button>
         <button class="btn small" onclick="replicateVideo('${b.videoId}','')">Replicate script</button>
       </div>`).join('') : '<p class="muted">Is threshold par koi breakout nahi — minimum kam karke dekho.</p>';
   } catch (e) { $('#breakoutList').innerHTML = `<p class="status err">${e.message}</p>`; }
@@ -315,6 +442,60 @@ $('#scriptDownload').onclick = () => {
   a.click();
 };
 
+// ---------- Trending 24h ----------
+// Full list loads ONCE (daily cache on the server); pages are sliced
+// client-side — no API call per page.
+async function loadTrending(refresh) {
+  // No key guard here on purpose: non-allowed users get the CACHED run
+  // server-side masked without needing a key; allowed users without a key
+  // get the server's "API key" error shown below.
+  const box = $('#trendingList');
+  const niche = $('#trendingNiche').value.trim();
+  box.innerHTML = '<p>Trending channels dhoond rahe hain… (pehli dafa ~1–2 minute lag sakte hain)</p>';
+  try {
+    const q = new URLSearchParams();
+    if (niche) q.set('niche', niche);
+    else if (currentMapId) q.set('mapId', currentMapId);
+    if (refresh) q.set('refresh', '1');
+    const r = await api('/api/trending?' + q.toString());
+    trendingData = r; trendingPage = 0;
+    $('#trendingAsOf').textContent = `Data as of: ${new Date(r.asOf).toLocaleString()}${r.cached ? ' (cached — aaj ka data)' : ''} · Is run par quota: ${fmt(r.quotaUsed)} units · Niche: ${r.niche}`;
+    $('#trendingNote').textContent = r.note;
+    renderTrendingPage();
+  } catch (e) { box.innerHTML = `<p class="status err">${e.message}</p>`; }
+}
+function renderTrendingPage() {
+  const box = $('#trendingList');
+  const list = (trendingData && trendingData.channels) || [];
+  if (!list.length) {
+    box.innerHTML = '<p class="muted">Pichle 24h mein is niche mein koi naya qualifying channel nahi mila. (Criteria: channel 30–60 din purana, 1000+ subs, aur 24h video ke views 100,000+.)</p>';
+    $('#trendingPager').classList.add('hidden');
+    return;
+  }
+  const pages = Math.max(1, Math.ceil(list.length / TRENDING_PAGE_SIZE));
+  if (trendingPage >= pages) trendingPage = pages - 1;
+  if (trendingPage < 0) trendingPage = 0;
+  const slice = list.slice(trendingPage * TRENDING_PAGE_SIZE, (trendingPage + 1) * TRENDING_PAGE_SIZE);
+  box.innerHTML = slice.map(c => `
+    <div class="bitem">
+      <img class="dp" src="${thumbUrl(c.thumbnail)}" onerror="imgFallback(this,'${escAttr(c.title)}')">
+      <div class="grow"><div class="t">${c.title}</div>
+      <div class="m">${fmt(c.subs)} subs · ${c.ageDays} days old · channel median ${fmt(c.medianViews)} views</div>
+      ${c.videos.map(v => `<div class="t" style="font-weight:400;font-size:14px">${v.title}</div><div class="m">${fmt(v.views)} views · ${v.multiple == null ? 'outlier n/a (median &lt; 100)' : v.multiple + '×'} · ${ago(v.publishedAt)} · ${v.duration}</div>`).join('')}
+      </div>
+      ${c.bestMultiple == null ? '<span class="badge-amber">n/a</span>' : `<span class="badge-amber">${c.bestMultiple}×</span>`}
+    </div>`).join('');
+  const pager = $('#trendingPager');
+  pager.classList.remove('hidden');
+  $('#trendingPageInfo').textContent = `Page ${trendingPage + 1} of ${pages} · ${list.length} channels`;
+  $('#trendingPrev').disabled = trendingPage === 0;
+  $('#trendingNext').disabled = trendingPage >= pages - 1;
+}
+$('#trendingBtn').onclick = () => loadTrending(false);
+$('#trendingRefreshBtn').onclick = () => loadTrending(true);
+$('#trendingPrev').onclick = () => { if (trendingPage > 0) { trendingPage--; renderTrendingPage(); } };
+$('#trendingNext').onclick = () => { trendingPage++; renderTrendingPage(); };
+
 // ---------- results ----------
 async function loadResults() {
   try {
@@ -330,22 +511,14 @@ async function loadResults() {
 }
 
 // ---------- resume latest map on load ----------
+// Default = NEWEST map (by createdAt, newest first — server also sorts).
 async function init() {
   await loadStatus();
   loadResults();
   try {
-    const r = await api('/api/maps');
-    if (r.maps && r.maps.length) {
-      const full = await api('/api/maps/' + r.maps[0].id);
-      currentMapId = full.map.id;
-      currentMap = full.map;
-      renderMap(); renderBreakouts(); renderTopics();
-      if (currentMap.status === 'building') {
-        setStatus($('#buildStatus'), 'Pichla map adhoora tha — Continue building se resume karo.', 'ok');
-        $('#continueBtn').classList.remove('hidden');
-        $('#progress').classList.remove('hidden');
-        $('#progressText').textContent = `Depth ${currentMap.builtDepth} of ${currentMap.depth} ready — ${currentMap.channels.length} channels`;
-      }
+    await loadMapList();
+    if (mapsList.length) {
+      await loadMap(mapsList[0].id);
     } else {
       renderBreakouts(); renderTopics();
     }
