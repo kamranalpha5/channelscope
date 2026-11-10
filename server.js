@@ -51,6 +51,8 @@ app.post('/api/billing/webhook', express.raw({ type: 'application/json' }), asyn
 // Privacy Policy — public page (no login, no allowlist). Required for the
 // YouTube Audit and Quota Extension Form: https://<host>/privacy
 app.get('/privacy', (req, res) => res.sendFile(path.join(__dirname, 'public', 'privacy.html')));
+app.get('/pricing', (req, res) => res.sendFile(path.join(__dirname, 'public', 'pricing.html')));
+
 
 app.use(express.json({ limit: '1mb' }));
 app.use(express.static(path.join(__dirname, 'public')));
