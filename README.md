@@ -2,7 +2,7 @@
 
 makina.studio-style tool, apni branding ke saath. Apne PC par chalao, apni YouTube Data API v3 key se.
 
-**Version 1.3.2** — refund on failed/stalled builds, real-quota search guard (a search `quotaExceeded` today blocks new builds before charging), admin token exemption (admins never pay tokens — header chip reads "Admin · Unlimited"), full design polish (shared design system, skeletons, SVG icons, no emoji-as-icons), public Terms of Service (`/terms`). Also in 1.3.1: token system + Stripe plans, pure-English UI, separate admin panel (`/admin`), single-key model, search error surfacing, 0-subs fix, viral floor (≥100K views), clickable YouTube cards, daily search cache (100/day search quota), search-quota guard + display, public Privacy Policy (`/privacy`).
+**Version 1.3.3** — admin-lockout fix: setup stays open while NO admin exists (a normal user registering first no longer locks the owner out); setup with an already-registered email promotes it to admin. Also in 1.3.2 — refund on failed/stalled builds, real-quota search guard (a search `quotaExceeded` today blocks new builds before charging), admin token exemption (admins never pay tokens — header chip reads "Admin · Unlimited"), full design polish (shared design system, skeletons, SVG icons, no emoji-as-icons), public Terms of Service (`/terms`). Also in 1.3.1: token system + Stripe plans, pure-English UI, separate admin panel (`/admin`), single-key model, search error surfacing, 0-subs fix, viral floor (≥100K views), clickable YouTube cards, daily search cache (100/day search quota), search-quota guard + display, public Privacy Policy (`/privacy`).
 
 ## Overview page (home page — `/`)
 

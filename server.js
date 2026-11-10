@@ -1977,17 +1977,27 @@ app.get('/api/results', (req, res) => {
 app.get('/api/auth/me', (req, res) => {
   const auth = getAuth(req);
   const store = getUsers();
-  res.json({ ok: true, loggedIn: auth.loggedIn, email: auth.email, role: auth.role, allowed: auth.allowed, setupNeeded: store.users.length === 0 });
+  res.json({ ok: true, loggedIn: auth.loggedIn, email: auth.email, role: auth.role, allowed: auth.allowed, setupNeeded: !store.users.some(u => u.role === 'admin') });
 });
 app.post('/api/auth/setup', (req, res) => {
-  // First-run admin creation — only works while ZERO users exist.
+  // First-run admin creation — allowed while NO admin exists yet (not just
+  // while zero users exist: a normal user may have registered first, and
+  // that must not lock the owner out of the admin panel forever).
   const store = getUsers();
-  if (store.users.length > 0) return res.status(403).json({ ok: false, error: 'An admin account already exists.' });
+  if (store.users.some(u => u.role === 'admin')) return res.status(403).json({ ok: false, error: 'An admin account already exists.' });
   const email = normEmail(req.body && req.body.email);
   const password = String((req.body && req.body.password) || '');
   if (!validEmail(email)) return res.status(400).json({ ok: false, error: 'Please enter a valid email address.' });
   if (password.length < 8) return res.status(400).json({ ok: false, error: 'Password must be at least 8 characters.' });
-  store.users.push({ email, password: hashPassword(password), role: 'admin', createdAt: new Date().toISOString() });
+  const existing = store.users.find(u => u.email === email);
+  if (existing) {
+    // Same email already registered as a normal user — promote it to admin
+    // instead of creating a duplicate (login finds the first match).
+    existing.role = 'admin';
+    existing.password = hashPassword(password);
+  } else {
+    store.users.push({ email, password: hashPassword(password), role: 'admin', createdAt: new Date().toISOString() });
+  }
   saveUsers(store);
   setSessionCookie(res, email);
   res.json({ ok: true, email, role: 'admin', allowed: true });
