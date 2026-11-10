@@ -4,6 +4,7 @@
 // Niche is derived per seed channel from that channel's own titles/tags/category.
 
 const express = require('express');
+const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 
@@ -38,6 +39,107 @@ function saveSettings(s) { saveJson(SETTINGS_FILE, s); }
 function getMaps() { return loadJson(MAPS_FILE, { maps: [] }).maps; }
 function saveMaps(maps) { saveJson(MAPS_FILE, { maps }); }
 function todayStr() { return new Date().toISOString().slice(0, 10); }
+
+// ---------- auth: email + password, allowlist-gated Overview/Trending ----------
+// Passwords: node:crypto scrypt (no new npm dependency). Sessions: HMAC-signed
+// cookie token. Users + allowlist live in data/users.json — on the free Render
+// plan a restart can reset data/, so the admin may need to re-add them
+// (see README caveat; ADMIN_EMAIL/ADMIN_PASSWORD env vars re-create the admin
+// automatically on every boot).
+const USERS_FILE = path.join(DATA_DIR, 'users.json');
+const SECRET_FILE = path.join(DATA_DIR, 'secret.json');
+function getUsers() { return loadJson(USERS_FILE, { users: [], allowlist: [] }); }
+function saveUsers(u) { saveJson(USERS_FILE, u); }
+function getSecret() {
+  let s = loadJson(SECRET_FILE, null);
+  if (!s || !s.secret) { s = { secret: crypto.randomBytes(32).toString('hex') }; saveJson(SECRET_FILE, s); }
+  return s.secret;
+}
+function normEmail(e) { return String(e || '').trim().toLowerCase(); }
+function validEmail(e) { return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e); }
+function hashPassword(password) {
+  const salt = crypto.randomBytes(16).toString('hex');
+  const hash = crypto.scryptSync(password, salt, 64).toString('hex');
+  return salt + ':' + hash;
+}
+function verifyPassword(password, stored) {
+  try {
+    const [salt, hash] = stored.split(':');
+    const h = crypto.scryptSync(password, salt, 64).toString('hex');
+    const a = Buffer.from(h, 'hex'), b = Buffer.from(hash, 'hex');
+    return a.length === b.length && crypto.timingSafeEqual(a, b);
+  } catch (e) { return false; }
+}
+function signSession(email) {
+  const exp = Date.now() + 7 * 86400 * 1000; // 7 days
+  const payload = Buffer.from(email, 'utf8').toString('base64url') + '.' + exp;
+  const sig = crypto.createHmac('sha256', getSecret()).update(payload).digest('hex');
+  return payload + '.' + sig;
+}
+function verifySession(token) {
+  try {
+    const parts = String(token || '').split('.');
+    if (parts.length !== 3) return null;
+    const [b64, exp, sig] = parts;
+    if (Date.now() > +exp) return null;
+    const expect = crypto.createHmac('sha256', getSecret()).update(b64 + '.' + exp).digest('hex');
+    const a = Buffer.from(sig, 'hex'), b = Buffer.from(expect, 'hex');
+    if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return null;
+    return { email: Buffer.from(b64, 'base64url').toString('utf8'), exp: +exp };
+  } catch (e) { return null; }
+}
+function parseCookies(req) {
+  const out = {};
+  for (const part of (req.headers.cookie || '').split(';')) {
+    const i = part.indexOf('=');
+    if (i > 0) out[part.slice(0, i).trim()] = decodeURIComponent(part.slice(i + 1).trim());
+  }
+  return out;
+}
+function getAuth(req) {
+  const s = verifySession(parseCookies(req).cs_session);
+  if (!s) return { loggedIn: false, email: null, role: null, allowed: false };
+  const store = getUsers();
+  const user = store.users.find(u => u.email === normEmail(s.email));
+  if (!user) return { loggedIn: false, email: null, role: null, allowed: false };
+  const allowed = user.role === 'admin' || store.allowlist.includes(normEmail(user.email));
+  return { loggedIn: true, email: user.email, role: user.role, allowed };
+}
+function setSessionCookie(res, email) {
+  res.setHeader('Set-Cookie', `cs_session=${signSession(email)}; HttpOnly; Path=/; SameSite=Lax; Max-Age=${7 * 86400}`);
+}
+function clearSessionCookie(res) {
+  res.setHeader('Set-Cookie', 'cs_session=; HttpOnly; Path=/; SameSite=Lax; Max-Age=0');
+}
+// First admin from env (Render dashboard: ADMIN_EMAIL + ADMIN_PASSWORD).
+// Re-runs on every boot, so a free-plan restart re-creates the admin.
+function ensureAdminFromEnv() {
+  const email = normEmail(process.env.ADMIN_EMAIL);
+  const pass = process.env.ADMIN_PASSWORD;
+  if (!email || !pass || !validEmail(email) || pass.length < 8) return;
+  const store = getUsers();
+  if (store.users.some(u => u.email === email)) return;
+  store.users.push({ email, password: hashPassword(pass), role: 'admin', createdAt: new Date().toISOString() });
+  saveUsers(store);
+  console.log('Admin account created from env for', email);
+}
+const ACCESS_NOTE = 'Ye data sirf allowed users ko dikhta hai — access ke liye admin se rabta karo.';
+// SERVER-SIDE MASKING: non-allowed users never receive real channel/video
+// data in Overview/Trending responses — names become "•••", DPs/numbers null.
+// CSS blur alone would still leak the data in the JSON; this does not.
+function maskChannelRow(r) {
+  return { ...r, id: null, title: '•••', thumbnail: null, subs: null, ageDays: null, medianViews: null, bestMultiple: null, bestViews: null, avgViews: null, videoCount: null, bestPublishedAt: null };
+}
+function maskVideoCard(v) {
+  return { ...v, id: null, title: '•••', thumbnail: null, duration: null, views: null, publishedAt: null, channelId: null, channelTitle: '•••', channelThumbnail: null, subs: null, vph: null };
+}
+function maskTrendingChannel(c) {
+  return {
+    ...c, channelId: null, title: '•••', thumbnail: null, subs: null, ageDays: null,
+    channelPublishedAt: null, medianViews: null, bestMultiple: null, bestViews: null,
+    videos: (c.videos || []).map(v => ({ ...v, id: null, title: '•••', views: null, multiple: null, publishedAt: null, duration: null, thumbnail: null }))
+  };
+}
 
 function quotaResetIfNeeded(s) {
   if (s.quotaDate !== todayStr()) { s.quotaUsed = 0; s.quotaDate = todayStr(); }
@@ -99,22 +201,84 @@ function ytCost(endpoint) { return endpoint.startsWith('/search') ? 100 : 1; }
 // ---------- text helpers ----------
 const STOP_EN = new Set(('a,an,the,and,or,of,to,in,on,for,with,by,at,from,as,is,are,was,were,it,its,this,that,these,those,how,why,what,when,where,which,who,whom,can,could,should,would,will,just,not,no,yes,you,your,we,our,they,their,he,she,his,her,i,me,my,do,does,did,have,has,had,be,been,being,all,any,more,most,other,some,such,only,own,same,so,than,too,very,about,into,through,after,over,between,out,up,down,off,again,further,then,once,here,there,all,also,new,top,best,video,videos,part,episode,watch,official,full,hd,4k').split(','));
 const STOP_KO = new Set(('이,그,저,것,수,등,와,과,은,는,을,를,에,에서,의,가,도,으로,로,하고,이다,입니다,있는,있다,없다,하다,되다,보다,위해,때문,정도,아주,너무,정말,진짜,왜,어떻게,무엇,누가,언제,어디,오늘,내일,어제,이번,다음,처음,마지막,그리고,하지만,그래서,그러나,지금,여기,저기,우리,나,너,그녀,그들,바로,아직,벌써,벌써,많이,조금,다,모두,영상,채널,구독,좋아요,알림,설정,보기,설명,댓글,공유,재생,목록,전체,무료,최신,인기,추천,정보,방법,후기,리뷰,정리,완벽,쉽게,빠르게,바로,알아보기,알아보자,알려드립니다,알려드릴게요,해보자,해봅시다,시작,끝,결론,요약,정리해드릴게요').split(','));
+// Spanish stopwords — v1.2.0 filtered only EN + KO, so Spanish stopwords
+// ("que / de / se / con / el / es / la / una / por") became niche keywords,
+// which made neighbour search + vetting meaningless (ButacaSalvaje2 map).
+const STOP_ES = new Set(('de,la,el,los,las,un,una,unos,unas,que,en,y,o,u,es,son,se,su,sus,al,del,con,por,para,como,más,mas,pero,este,esta,estos,estas,eso,esa,ese,aquel,aquella,yo,tú,él,ella,nosotros,vosotros,ellos,ellas,mi,mis,tu,tus,nos,os,le,les,me,te,lo,ya,no,sí,si,también,tampoco,muy,mucho,mucha,muchos,muchas,poco,poca,estoy,estás,está,estamos,están,era,eran,fue,fueron,ser,tiene,tienen,tengo,puedes,puede,pueden,hacer,dice,dicen,año,años,vez,veces,hoy,ayer,mañana,siempre,nunca,donde,cuando,porque,pues,hasta,desde,entre,sobre,sin,tras,ante,bajo,hacia,según,cada,otro,otra,otros,otras,mismo,misma,todos,todas,nadie,alguien,algo,nada,quien,quienes,cual,cuales,cuánto,cuánta,cuántos,cuántas,cómo,dónde,cuándo,qué,cuál,quién,completo,completa,completos,completas,capitulo,capítulo,episodio,temporada,parte,ver,mira,suscribete,suscribirse,gracias,bueno,buena,creo,quiero,puedo').split(','));
+const STOP_FR = new Set(('le,la,les,de,des,du,un,une,et,est,dans,pour,que,qui,sur,pas,plus,ce,cet,cette,ces,il,ils,elle,elles,nous,vous,je,tu,on,au,aux,en,à,a,y,se,son,sont,être,avoir,avec,sans,chez,par,comme,tout,tous,toute,toutes,même,aussi,bien,mal,très,peu,beaucoup,jour,jours,ans,an,fois,aujourd,hui,hier,demain,toujours,jamais,où,quand,pourquoi,comment,complet,complète,complets,complètes,épisode,saison,partie,officiel,gratuit,ligne,regarder,voir,abonnez,merci,bon,bonne,je,suis,faire,dire,peut,peuvent').split(','));
+const STOP_DE = new Set(('der,die,das,den,dem,des,ein,eine,einen,einem,einer,und,ist,sind,war,waren,von,zu,mit,sich,für,auf,an,in,im,aus,bei,nach,über,unter,durch,vor,als,wie,was,wer,wo,wann,warum,nicht,kein,keine,auch,nur,noch,schon,sehr,mehr,viel,wenig,alle,alles,man,es,ich,du,er,sie,wir,ihr,mein,dein,sein,haben,hat,kann,können,wird,werden,wurde,folge,staffel,teil,offiziell,kostenlos,online,schauen,sehen,abonnieren,danke,gut,geht,machen,sagen').split(','));
+const STOP_PT = new Set(('de,a,o,os,as,um,uma,uns,umas,que,em,e,é,são,se,seu,sua,seus,suas,ao,do,da,dos,das,com,por,para,como,mais,mas,este,esta,estes,estas,isso,esse,essa,aquele,aquela,eu,tu,ele,ela,nós,vós,eles,elas,meu,minha,meus,minhas,teu,tua,lhe,lhes,me,te,nos,vos,já,não,sim,também,muito,muita,muitos,muitas,pouco,pouca,estou,está,estamos,estão,era,eram,foi,foram,ser,tem,têm,tenho,pode,podem,fazer,diz,dizem,ano,anos,vez,vezes,hoje,ontem,amanhã,sempre,nunca,onde,quando,porque,até,desde,entre,sobre,sem,cada,outro,outra,outros,outras,mesmo,mesma,todos,todas,ninguém,alguém,algo,nada,quem,qual,quais,quanto,quanta,quantos,quantas,completo,completa,completos,completas,episódio,temporada,parte,oficial,grátis,assistir,ver,inscreva,inscrever,obrigado,obrigada,bom,boa').split(','));
+// Generic words that are never a niche on their own (any language).
+const GENERIC = new Set(('movie,movies,film,films,trailer,trailers,clip,clips,live,shorts,short,channel,free,download,online,review,reviews,unboxing,vlog,vlogs,remix,cover,lyrics,audio,show,shows,series,season,tv,episode,episodes,full,hd,hq,4k,1080p,720p,480p,official,best,new,top,watch,video,videos,complete,completed,pelicula,película,peliculas,películas,vidéo,vidéos,vídeo,vídeos,filme,filmes,video,vídeo').split(','));
+
+function isStopword(t) {
+  return STOP_EN.has(t) || STOP_KO.has(t) || STOP_ES.has(t) || STOP_FR.has(t) || STOP_DE.has(t) || STOP_PT.has(t) || GENERIC.has(t);
+}
 
 function tokenize(text) {
   if (!text) return [];
-  return (text.toLowerCase().match(/[a-z0-9]+|[\uac00-\ud7a3]+/g) || [])
-    .filter(t => t.length >= 2 && !STOP_EN.has(t) && !STOP_KO.has(t) && !/^\d+$/.test(t));
+  // Accented Latin letters (\u00c0-\u00ff) stay inside tokens: "película" must
+  // not split into "pel"+"cula" (that broke Spanish keyword extraction).
+  return (text.toLowerCase().match(/[a-z0-9\u00c0-\u00ff]+|[\uac00-\ud7a3]+/g) || [])
+    .map(stripKoParticle)
+    .filter(t => t.length >= 2 && !isStopword(t) && !/^\d+$/.test(t));
+}
+
+// Light Korean particle stemmer: 경제를 / 경제는 / 경제의 → 경제, 월급은 → 월급.
+// Without it, every particle form becomes a separate "keyword" and the base
+// word's document frequency fragments. Only strips when the particle fits
+// the preceding syllable (이/을/은/과/으로 after a consonant-final syllable,
+// 가/를/는/와/로 after a vowel-final one); never strips to a 1-char result.
+function koHasFinal(ch) {
+  const code = ch.charCodeAt(0) - 0xAC00;
+  return code >= 0 && code < 11172 && (code % 28) !== 0;
+}
+function stripKoParticle(t) {
+  if (!/[\uac00-\ud7a3]/.test(t) || t.length < 3) return t;
+  const multi = ['에서', '으로', '로서', '으로서', '로써', '에게', '한테', '부터', '까지', '처럼', '보다', '이랑', '하고'];
+  for (const p of multi) {
+    if (t.endsWith(p) && t.length - p.length >= 2) return t.slice(0, -p.length);
+  }
+  const last = t[t.length - 1];
+  const prev = t[t.length - 2];
+  const final = koHasFinal(prev);
+  const one = final
+    ? { '을': 1, '은': 1, '이': 1, '과': 1 }
+    : { '를': 1, '는': 1, '가': 1, '와': 1, '로': 1 };
+  if (one[last] && t.length - 1 >= 2) return t.slice(0, -1);
+  if ('의에도만랑'.includes(last) && t.length - 1 >= 2) return t.slice(0, -1);
+  return t;
+}
+
+// Language family of a text: 'ko' | 'es' | 'fr' | 'de' | 'pt' | 'en'.
+// Used by the niche test: a candidate must share the seed's language family
+// OR its YouTube category — a loose keyword match alone is not enough.
+function detectLangFamily(text) {
+  const t = (text || '').toLowerCase();
+  const ko = (t.match(/[\uac00-\ud7a3]/g) || []).length;
+  const latin = (t.match(/[a-z\u00c0-\u00ff]/g) || []).length;
+  if (ko > latin * 0.5 && ko >= 3) return 'ko';
+  const toks = t.match(/[a-z\u00c0-\u00ff]+/g) || [];
+  const counts = { es: 0, fr: 0, de: 0, pt: 0 };
+  const MARK = {
+    es: new Set(['de', 'la', 'el', 'los', 'las', 'que', 'una', 'con', 'para', 'del', 'su', 'sus', 'por', 'es', 'son', 'como', 'pero', 'este', 'esta', 'película', 'cine', 'está']),
+    fr: new Set(['le', 'les', 'des', 'une', 'est', 'dans', 'pour', 'qui', 'sur', 'pas', 'plus', 'ces', 'aux', 'avec', 'vous', 'nous', 'tout', 'tous', 'très']),
+    de: new Set(['der', 'die', 'das', 'den', 'und', 'ist', 'sind', 'von', 'mit', 'für', 'auf', 'ein', 'eine', 'nicht', 'auch', 'noch', 'wie', 'haben', 'wird', 'werden']),
+    pt: new Set(['que', 'uma', 'com', 'para', 'não', 'você', 'seus', 'suas', 'dos', 'das', 'como', 'mais', 'este', 'esta', 'filme', 'muito', 'são'])
+  };
+  if (/[ñ¿¡]/.test(t)) counts.es += 3;
+  if (/[ãõç]/.test(t)) counts.pt += 3;
+  if (/[àâçèéêëîïôûù]/.test(t)) counts.fr += 2;
+  if (/[äöüß]/.test(t)) counts.de += 2;
+  for (const tok of toks) for (const k of Object.keys(MARK)) if (MARK[k].has(tok)) counts[k]++;
+  const best = Object.entries(counts).sort((a, b) => b[1] - a[1])[0];
+  if (best[1] >= 3) return best[0];
+  return 'en';
 }
 function topTokens(texts, limit) {
   const freq = new Map();
   for (const t of texts) for (const tok of tokenize(t)) freq.set(tok, (freq.get(tok) || 0) + 1);
   return [...freq.entries()].sort((a, b) => b[1] - a[1]).slice(0, limit).map(e => e[0]);
-}
-function isKorean(text) {
-  if (!text) return false;
-  const ko = (text.match(/[\uac00-\ud7a3]/g) || []).length;
-  const latin = (text.match(/[a-z]/gi) || []).length;
-  return ko > latin * 0.5 && ko >= 3;
 }
 function parseDuration(iso) {
   if (!iso) return 0;
@@ -279,32 +443,71 @@ function channelSummary(item, videos) {
 }
 
 // ---------- niche derivation + niche test ----------
+// Keyword rules (v1.3.0): length ≥ 3; never a stopword in ANY supported
+// language (EN/KO/ES/FR/DE/PT) or a generic word; prefer tokens that appear in
+// ≥2 seed videos/tags; fill only with tokens seen ≥2 times anywhere. A niche
+// keyword must never be a stopword — the v1.2.0 chips ("que / de / se / con /
+// el / es / la / una / por") were Spanish stopwords, which is why the
+// ButacaSalvaje2 website map found zero neighbours.
 function deriveNiche(seedChannel, seedVideos) {
-  const texts = [seedChannel.title, seedChannel.description];
-  for (const v of seedVideos) { texts.push(v.title, v.description, (v.tags || []).join(' ')); }
-  const keywords = topTokens(texts, 12);
+  const docs = [];
+  for (const v of seedVideos) docs.push(tokenize(v.title + ' ' + (v.tags || []).join(' ')));
+  const descToks = tokenize(seedChannel.description || '');
+  const titleToks = tokenize(seedChannel.title || '');
+  // Document frequency: in how many seed videos does the token appear?
+  const docCount = new Map();
+  for (const toks of docs) {
+    const seen = new Set(toks);
+    for (const t of seen) docCount.set(t, (docCount.get(t) || 0) + 1);
+  }
+  const totalFreq = new Map();
+  const bump = (toks) => { for (const t of toks) totalFreq.set(t, (totalFreq.get(t) || 0) + 1); };
+  for (const toks of docs) bump(toks);
+  bump(descToks); bump(titleToks);
+  const cands = [...totalFreq.keys()].filter(t => t.length >= 3 || /[\uac00-\ud7a3]/.test(t));
+  const byFreq = (a, b) => (totalFreq.get(b) - totalFreq.get(a)) || (docCount.get(b) || 0) - (docCount.get(a) || 0);
+  // Strong keywords: in ≥2 seed videos/tags.
+  let keywords = cands.filter(t => (docCount.get(t) || 0) >= 2).sort(byFreq).slice(0, 12);
+  // Fill up to 5 only with tokens seen ≥2 times anywhere (never one-off words
+  // like a watermark/app name from a single video title).
+  if (keywords.length < 5) {
+    const fillers = cands.filter(t => !keywords.includes(t) && (totalFreq.get(t) || 0) >= 2).sort(byFreq);
+    keywords = keywords.concat(fillers).slice(0, 12);
+  }
+  if (keywords.length === 0) {
+    // Fallback: seed's YouTube topic categories + description words.
+    const catToks = tokenize((seedChannel.topicCategories || []).join(' ')).filter(t => t.length >= 3 || /[\uac00-\ud7a3]/.test(t));
+    const descLong = descToks.filter(t => t.length >= 3 || /[\uac00-\ud7a3]/.test(t));
+    keywords = [...new Set([...catToks, ...descLong])].slice(0, 12);
+  }
+  // Never build on an empty niche — the route turns this into a clear error.
+  if (keywords.length === 0) throw new Error('Niche derive nahi ho saki — seed channel ki videos/tags mein koi usable keyword nahi mila. Koi aur seed channel try karo.');
   const categories = seedChannel.topicCategories || [];
-  const korean = isKorean(seedVideos.map(v => v.title).join(' ') + ' ' + seedChannel.title);
-  return { keywords, categories, korean, language: korean ? 'ko' : 'en' };
+  const allText = seedVideos.map(v => v.title).join(' ') + ' ' + seedChannel.title + ' ' + (seedChannel.description || '');
+  const family = detectLangFamily(allText);
+  return { keywords, categories, korean: family === 'ko', language: family };
 }
 
 function nicheTest(candidate, candidateVideos, niche) {
-  // Candidate must show the seed's niche in its OWN videos/tags/category.
+  // Candidate must show the seed's niche in its OWN videos/tags/category:
+  // ≥2 niche keywords AND (same language family OR same YouTube category).
   const texts = [candidate.title, candidate.description];
   for (const v of candidateVideos) { texts.push(v.title, (v.tags || []).join(' ')); }
-  const toks = new Set(tokenize(texts.join(' ')));
+  const joined = texts.join(' ');
+  const toks = new Set(tokenize(joined));
   const hits = niche.keywords.filter(k => toks.has(k.toLowerCase()));
   const catHit = (candidate.topicCategories || []).some(c =>
     niche.categories.some(nc => c.toLowerCase().includes(nc.toLowerCase().split(' ')[0]) || nc.toLowerCase().includes(c.toLowerCase().split(' ')[0])));
-  const candKorean = isKorean(candidateVideos.map(v => v.title).join(' '));
-  const langOk = niche.korean ? (candKorean || hits.length >= 3) : true;
-  const pass = langOk && (hits.length >= 2 || (hits.length >= 1 && catHit));
-  return { pass, hits, catHit, langOk };
+  const candFamily = detectLangFamily(joined);
+  const langOk = candFamily === niche.language;
+  const pass = hits.length >= 2 && (langOk || catHit);
+  return { pass, hits, catHit, langOk, candFamily };
 }
 
 async function discoverNeighbours(niche, excludeIds, limit, key, settings) {
   const found = [];
   const seen = new Set(excludeIds);
+  const diagnostics = { searchesRun: 0, searchesOk: 0, searchesFailed: 0, candidatesFound: 0, vettedPassed: 0 };
   // Build-scoped cache: a channel/video is never fetched twice in one build.
   const cache = { channels: new Map(), videos: new Map() };
   // Search each top niche keyword for channels + videos (keyword-anchored, never relatedToVideoId).
@@ -313,17 +516,20 @@ async function discoverNeighbours(niche, excludeIds, limit, key, settings) {
   const searchJobs = [];
   for (const q of queries) { searchJobs.push({ q, type: 'channel' }); searchJobs.push({ q, type: 'video' }); }
   const searchResults = await mapPool(searchJobs, async (job) => {
+    diagnostics.searchesRun++;
     try {
       const d = await yt('/search', { part: 'snippet', type: job.type, q: job.q, maxResults: 10 }, key);
       addQuota(settings, ytCost('/search'));
+      diagnostics.searchesOk++;
       return (d.items || []).map(it => it.snippet.channelId).filter(Boolean);
-    } catch (e) { return []; } // one failed keyword must not kill the build
+    } catch (e) { diagnostics.searchesFailed++; return []; } // one failed keyword must not kill the build
   }, 6);
   const candidateIds = [];
   for (const ids of searchResults) {
     for (const id of ids) { if (!seen.has(id)) { seen.add(id); candidateIds.push(id); } }
     if (candidateIds.length >= limit * 2) break;
   }
+  diagnostics.candidatesFound = candidateIds.length;
   // Vet every candidate against the niche before it enters the map.
   // Chunks run in parallel (pool 3); inside a chunk, per-channel video fetches
   // run in parallel (pool 6) — that sequential loop was the biggest bottleneck:
@@ -349,7 +555,8 @@ async function discoverNeighbours(niche, excludeIds, limit, key, settings) {
     for (const ch of list) { if (found.length < limit) found.push(ch); }
     if (found.length >= limit) break;
   }
-  return found;
+  diagnostics.vettedPassed = found.length;
+  return { neighbours: found, diagnostics };
 }
 
 // ---------- helpers for routes ----------
@@ -365,6 +572,26 @@ function findMap(id) {
   const maps = getMaps();
   const map = maps.find(m => m.id === id);
   return { maps, map };
+}
+// STALE-MAP FIX (v1.3.0): never save a maps array captured before a long
+// await. The old expand route read maps.json, awaited discovery (tens of
+// seconds), then saved its stale snapshot — any map created meanwhile was
+// silently deleted from the file, so a refresh kept showing the old map.
+// upsertMap re-reads the file immediately before writing, then replaces (or
+// inserts) just this one map, so concurrent builds can never clobber each other.
+function upsertMap(updated) {
+  const maps = getMaps();
+  const i = maps.findIndex(m => m.id === updated.id);
+  if (i >= 0) maps[i] = updated; else maps.unshift(updated);
+  saveMaps(maps);
+  return maps;
+}
+function deleteMapById(id) {
+  const maps = getMaps();
+  saveMaps(maps.filter(m => m.id !== id));
+}
+function sortMapsNewest(maps) {
+  return [...maps].sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0));
 }
 function ringCap(depth) { return depth >= 4 ? 273 : depth >= 2 ? 70 : 16; }
 function nextRingTarget(map) {
@@ -439,13 +666,22 @@ app.delete('/api/settings/key', (req, res) => {
 
 // ---------- maps ----------
 app.get('/api/maps', (req, res) => {
-  const maps = getMaps().map(m => ({
+  // Always newest first (by createdAt, not file order) — the frontend shows
+  // maps[0] by default, so this ordering IS which map the user sees on load.
+  const maps = sortMapsNewest(getMaps()).map(m => ({
     id: m.id, seedTitle: m.seedTitle, seedChannelId: m.seedChannelId,
     seedThumbnail: m.seedThumbnail, depth: m.depth, builtDepth: m.builtDepth,
     status: m.status, channelCount: m.channels.length, quotaUsed: m.quotaUsed || 0,
-    nicheKeywords: m.nicheKeywords || [], createdAt: m.createdAt
+    nicheKeywords: m.nicheKeywords || [], createdAt: m.createdAt,
+    stall: m.stall || null
   }));
   res.json({ ok: true, maps });
+});
+
+// Clear ALL maps (map switcher's "Clear all"). Defined before /:id routes.
+app.delete('/api/maps', (req, res) => {
+  saveMaps([]);
+  res.json({ ok: true });
 });
 
 app.get('/api/maps/:id', (req, res) => {
@@ -455,9 +691,9 @@ app.get('/api/maps/:id', (req, res) => {
 });
 
 app.delete('/api/maps/:id', (req, res) => {
-  const { maps, map } = findMap(req.params.id);
+  const { map } = findMap(req.params.id);
   if (!map) return res.status(404).json({ ok: false, error: 'Map nahi mila.' });
-  saveMaps(maps.filter(m => m.id !== map.id));
+  deleteMapById(map.id);
   res.json({ ok: true });
 });
 
@@ -489,9 +725,7 @@ app.post('/api/maps', async (req, res) => {
       createdAt: new Date().toISOString(),
       channels: [Object.assign(seed, { depth: 0 })]
     };
-    const maps = getMaps();
-    maps.unshift(map);
-    saveMaps(maps);
+    upsertMap(map);
     flushSettings(settings);
     res.json({ ok: true, map, message: 'Seed mil gaya — ab rings bhar rahe hain.' });
   } catch (e) {
@@ -503,27 +737,64 @@ app.post('/api/maps', async (req, res) => {
 app.post('/api/maps/:id/expand', async (req, res) => {
   const settings = needKey(res);
   if (!settings) return;
-  const { maps, map } = findMap(req.params.id);
+  const { map } = findMap(req.params.id);
   if (!map) return res.status(404).json({ ok: false, error: 'Map nahi mila.' });
+  if (map.status === 'stalled') map.status = 'building'; // retrying a stalled ring
   const target = nextRingTarget(map);
   if (target === null) {
     map.status = 'complete';
-    saveMaps(maps);
+    upsertMap(map);
     return res.json({ ok: true, map, done: true, message: 'Map complete hai.' });
   }
   try {
     const exclude = map.channels.map(c => c.id);
     const limit = target - map.channels.length;
     const ringDepth = map.builtDepth + 1;
-    const neighbours = await discoverNeighbours(map.niche, exclude, Math.max(limit, 0), settings.apiKey, settings);
+    const { neighbours, diagnostics } = await discoverNeighbours(map.niche, exclude, Math.max(limit, 0), settings.apiKey, settings);
+    // TOTAL search failure (e.g. quota exhausted): never silently save a
+    // seed-only ring as progress — return a clear error instead. This is the
+    // website-vs-localhost difference: the website build's searches failed and
+    // the old code returned ok:true with 0 neighbours, so the user saw a lone
+    // seed and no explanation.
+    if (diagnostics.searchesOk === 0 && neighbours.length === 0) {
+      upsertMap(map);
+      return res.status(400).json({
+        ok: false, error: 'YouTube searches fail ho gayi hain — quota khatam ho sakti hai ya API ne reject kar diya. Quota check karo aur thodi der baad "Continue building" dabao.',
+        diagnostics
+      });
+    }
+    if (neighbours.length === 0) {
+      // ZERO-NEIGHBOUR STATE: do not advance the ring and do not mark the
+      // map complete. Park the map as 'stalled' with the reason, so the UI
+      // can show it and offer "Try again" instead of a silent seed-only map.
+      map.status = 'stalled';
+      map.stall = {
+        ring: ringDepth,
+        reason: 'Is ring mein 0 neighbours mile.',
+        keywords: map.nicheKeywords || [],
+        candidatesFound: diagnostics.candidatesFound,
+        vettedPassed: diagnostics.vettedPassed,
+        searchesOk: diagnostics.searchesOk,
+        searchesFailed: diagnostics.searchesFailed,
+        quotaUsed: settings.quotaUsed || 0,
+        at: new Date().toISOString()
+      };
+      upsertMap(map);
+      flushSettings(settings);
+      return res.json({
+        ok: true, map, done: false, stalled: true, diagnostics,
+        message: `Depth ${ringDepth}: 0 neighbours mile — niche keywords (${(map.nicheKeywords || []).join(', ')}) par ${diagnostics.candidatesFound} candidates mile, ${diagnostics.vettedPassed} niche test pass kar sake.`
+      });
+    }
     for (const n of neighbours) { n.depth = ringDepth; map.channels.push(n); }
     map.builtDepth = ringDepth;
     map.status = nextRingTarget(map) === null ? 'complete' : 'building';
     map.quotaUsed = (map.quotaUsed || 0);
-    saveMaps(maps);
+    delete map.stall; // a successful ring clears any earlier stall
+    upsertMap(map);
     flushSettings(settings);
     res.json({
-      ok: true, map, done: map.status === 'complete',
+      ok: true, map, done: map.status === 'complete', diagnostics,
       message: `Depth ${ringDepth} of ${map.depth} ready — ${map.channels.length} channels.`
     });
   } catch (e) {
@@ -570,6 +841,15 @@ function coreEngine(ch) {
 function channelBreakdown(ch) {
   const vids = [...ch.videos].sort((a, b) => b.views - a.views);
   const med = ch.medianViews || 1;
+  // Breakout guard (v1.3.0): a video counts as a breakout only when its
+  // channel's median is ≥ 100 views. With a near-zero median (e.g. 21) the
+  // multiple explodes (173,759 / 21 ≈ 8274×) and means nothing.
+  const breakoutOk = (ch.medianViews || 0) >= 100;
+  const videoRow = v => ({
+    id: v.id, title: v.title, views: v.views,
+    multipleVsMedian: +(v.views / med).toFixed(1),
+    publishedAt: v.publishedAt, duration: fmtDuration(v.durationSec || 0)
+  });
   return {
     channel: {
       id: ch.id, title: ch.title, customUrl: ch.customUrl || '', country: ch.country || '',
@@ -579,15 +859,15 @@ function channelBreakdown(ch) {
       topicCategories: ch.topicCategories || []
     },
     postingCadence: coreEngine(ch).postingCadence,
-    topVideos: vids.slice(0, 10).map(v => ({
-      id: v.id, title: v.title, views: v.views,
-      multipleVsMedian: +(v.views / med).toFixed(1),
-      publishedAt: v.publishedAt, duration: fmtDuration(v.durationSec || 0)
-    })),
-    breakoutVideos: vids.filter(v => v.views >= med * 3).slice(0, 10).map(v => ({
+    topVideos: vids.slice(0, 10).map(videoRow),
+    // Full loaded-videos list (views desc) for the detail panel: every video
+    // with its outlier multiple, published date and views. The JSON download
+    // carries the same list, so a clicked channel is fully replicable.
+    videos: vids.map(v => Object.assign(videoRow(v), { thumbnail: v.thumbnail })),
+    breakoutVideos: breakoutOk ? vids.filter(v => v.views >= med * 3).slice(0, 10).map(v => ({
       id: v.id, title: v.title, views: v.views,
       multipleVsMedian: +(v.views / med).toFixed(1), publishedAt: v.publishedAt
-    })),
+    })) : [],
     titlePatterns: {
       questionTitles: ch.videos.filter(v => /\?/.test(v.title)).length,
       numberLedTitles: ch.videos.filter(v => /^\s*\d+/.test(v.title)).length,
@@ -620,26 +900,29 @@ app.get('/api/maps/:id/channels/:channelId/json', (req, res) => {
 });
 
 // ---------- breakouts ----------
+// Breakouts come ONLY from the currently selected map (the :id in the URL),
+// and only from channels whose median is ≥ 100 views — see channelBreakdown.
 app.get('/api/maps/:id/breakouts', (req, res) => {
   const { map } = findMap(req.params.id);
   if (!map) return res.status(404).json({ ok: false, error: 'Map nahi mila.' });
   const min = parseFloat(req.query.min || '3') || 3;
   const rows = [];
+  let excludedLowMedian = 0;
   for (const ch of map.channels) {
     const med = ch.medianViews || 0;
-    if (!med) continue;
+    if (med < 100) { if (med > 0) excludedLowMedian++; continue; }
     for (const v of ch.videos) {
       const mult = v.views / med;
       if (mult >= min) rows.push({
         videoId: v.id, title: v.title, views: v.views, multiple: +mult.toFixed(1),
         publishedAt: v.publishedAt, duration: fmtDuration(v.durationSec || 0),
         thumbnail: v.thumbnail, channelId: ch.id, channelTitle: ch.title,
-        channelThumbnail: ch.thumbnail, channelSubs: ch.subs
+        channelThumbnail: ch.thumbnail, channelSubs: ch.subs, channelMedian: med
       });
     }
   }
   rows.sort((a, b) => b.multiple - a.multiple);
-  res.json({ ok: true, min, count: rows.length, breakouts: rows });
+  res.json({ ok: true, min, count: rows.length, mapSeed: map.seedTitle, excludedLowMedian, breakouts: rows });
 });
 
 // ---------- topics (data-driven, no LLM key) ----------
@@ -995,6 +1278,155 @@ app.post('/api/maps/:id/videos/:videoId/replicate', async (req, res) => {
   }
 });
 
+// ---------- Trending 24h (NEW channels trending in the last 24 hours) ----------
+// DAILY CACHE: one niche's list is computed once per day, then served from
+// cache (quota saving — no re-search on every click). Cache file:
+// data/trending.json (gitignored like the other data files).
+const TRENDING_FILE = path.join(DATA_DIR, 'trending.json');
+function getTrendingCache() { return loadJson(TRENDING_FILE, { runs: {} }).runs; }
+function saveTrendingCache(runs) { saveJson(TRENDING_FILE, { runs }); }
+const TRENDING_MIN_MEDIAN = 100; // same guard as breakouts: no numeric outlier below this
+const TRENDING_SEARCH_KEYWORDS = 3; // searches cost 100 units each — bound the run
+const TRENDING_PAGE_NOTE = 'Criteria signal: 1000+ subs aur views lakhs mein (100,000+) — watch hours API se verify nahi ho sakte, is liye yehi signal use hota hai.';
+
+async function runTrending(keywords, key, settings) {
+  // Quota accounting for this run (search = 100 units, everything else = 1).
+  let runQuota = 0;
+  const charge = (endpoint, n) => { runQuota += ytCost(endpoint) * (n || 1); };
+  const publishedAfter = new Date(Date.now() - 24 * 3600 * 1000).toISOString();
+  // 1) Last-24h videos for the niche keywords (order=date → newest first).
+  const searchJobs = keywords.slice(0, TRENDING_SEARCH_KEYWORDS).map(q => ({ q }));
+  const searchResults = await mapPool(searchJobs, async (job) => {
+    try {
+      const d = await yt('/search', { part: 'snippet', type: 'video', q: job.q, publishedAfter, order: 'date', maxResults: 25 }, key);
+      addQuota(settings, ytCost('/search')); charge('/search');
+      return (d.items || []).map(it => ({
+        id: (it.id || {}).videoId, title: it.snippet.title,
+        channelId: it.snippet.channelId, channelTitle: it.snippet.channelTitle,
+        publishedAt: it.snippet.publishedAt,
+        thumbnail: (it.snippet.thumbnails && it.snippet.thumbnails.medium && it.snippet.thumbnails.medium.url) || ''
+      })).filter(v => v.id);
+    } catch (e) { return []; } // one failed keyword must not kill the run
+  }, TRENDING_SEARCH_KEYWORDS);
+  const byVideo = new Map();
+  for (const list of searchResults) for (const v of list) if (!byVideo.has(v.id)) byVideo.set(v.id, v);
+  const videos24h = [...byVideo.values()];
+  if (!videos24h.length) return { channels: [], quotaUsed: runQuota, searchedVideos: 0 };
+  // 2) View counts for the 24h videos (search results carry no statistics).
+  const vChunks = [];
+  for (let i = 0; i < videos24h.length; i += 50) vChunks.push(videos24h.slice(i, i + 50));
+  const viewResults = await mapPool(vChunks, async (chunk) => {
+    try {
+      const d = await yt('/videos', { part: 'statistics,contentDetails', id: chunk.map(v => v.id).join(',') }, key);
+      addQuota(settings, ytCost('/videos')); charge('/videos');
+      return d.items || [];
+    } catch (e) { return []; }
+  }, 2);
+  const viewsById = new Map();
+  for (const items of viewResults) for (const it of (items || [])) {
+    viewsById.set(it.id, { views: +(it.statistics.viewCount || 0), durationSec: parseDuration(it.contentDetails && it.contentDetails.duration) });
+  }
+  for (const v of videos24h) {
+    const s = viewsById.get(v.id) || { views: 0, durationSec: 0 };
+    v.views = s.views; v.durationSec = s.durationSec;
+  }
+  // 3) Group by channel; keep channels with a 24h video.
+  const byChannel = new Map();
+  for (const v of videos24h) {
+    if (!byChannel.has(v.channelId)) byChannel.set(v.channelId, []);
+    byChannel.get(v.channelId).push(v);
+  }
+  const channelIds = [...byChannel.keys()].slice(0, 40);
+  const details = await fetchChannelDetails(channelIds, key, settings);
+  const out = [];
+  for (const item of details) {
+    const sn = item.snippet || {};
+    const st = item.statistics || {};
+    const subs = +(st.subscriberCount || 0);
+    const ageDays = sn.publishedAt ? Math.max(1, Math.round((Date.now() - new Date(sn.publishedAt).getTime()) / 86400000)) : 0;
+    // Filter: channel 30–60 days old AND ≥ 1000 subscribers (monetization
+    // subs threshold, verified via API).
+    if (ageDays < 30 || ageDays > 60 || subs < 1000) continue;
+    const uploads = (item.contentDetails && item.contentDetails.relatedPlaylists && item.contentDetails.relatedPlaylists.uploads) || '';
+    let recent = [];
+    try { if (uploads) recent = await fetchChannelVideos(item.id, uploads, key, settings, 20); } catch (e) { /* ignore */ }
+    const med = median(recent.map(v => v.views));
+    const vids24 = (byChannel.get(item.id) || [])
+      .sort((a, b) => b.views - a.views)
+      .slice(0, 3)
+      .map(v => ({
+        id: v.id, title: v.title, views: v.views,
+        multiple: med >= TRENDING_MIN_MEDIAN ? +(v.views / med).toFixed(1) : null,
+        publishedAt: v.publishedAt, duration: fmtDuration(v.durationSec || 0), thumbnail: v.thumbnail
+      }));
+    if (!vids24.length) continue;
+    // CRITERIA SIGNAL (locked): the qualifying 24h video must ALSO have
+    // ≥ 100,000 views (lakhs mein). Logic: jis channel ke views lakhs mein
+    // hain, uske watch hours bhi poore honge — watch hours themselves are
+    // NOT verifiable via the YouTube Data API, so this is the signal.
+    // A channel that passes subs but not views does NOT enter the list.
+    if (vids24[0].views < 100000) continue;
+    const best = vids24[0];
+    out.push({
+      channelId: item.id,
+      title: sn.title || '',
+      thumbnail: (sn.thumbnails && (sn.thumbnails.high || sn.thumbnails.medium || sn.thumbnails.default) || {}).url || '',
+      subs, ageDays, channelPublishedAt: sn.publishedAt || '',
+      medianViews: med,
+      bestMultiple: best.multiple, bestViews: best.views,
+      videos: vids24
+    });
+  }
+  out.sort((a, b) => (b.bestMultiple || -1) - (a.bestMultiple || -1) || b.bestViews - a.bestViews);
+  return { channels: out, quotaUsed: runQuota, searchedVideos: videos24h.length };
+}
+
+app.get('/api/trending', async (req, res) => {
+  // Non-allowed users NEVER trigger a fresh scan (that would burn quota for
+  // data they cannot use) — they only get the cached run, server-side masked.
+  const auth = getAuth(req);
+  let keywords = [];
+  let nicheLabel = '';
+  const typed = (req.query.niche || '').trim();
+  if (typed) {
+    keywords = tokenize(typed).filter(t => t.length >= 3);
+    nicheLabel = typed;
+  } else if (req.query.mapId) {
+    const { map } = findMap(req.query.mapId);
+    if (!map) return res.status(404).json({ ok: false, error: 'Map nahi mila.' });
+    keywords = (map.nicheKeywords || []).slice();
+    nicheLabel = map.seedTitle + ' (map niche)';
+  } else {
+    return res.status(400).json({ ok: false, error: 'Pehle map banao ya niche likho — trending kis niche ki dikhayein?' });
+  }
+  if (!keywords.length) return res.status(400).json({ ok: false, error: 'Niche se koi usable keyword nahi nikla — koi aur niche likho.' });
+  const cacheKey = [...keywords].sort().join(',');
+  const today = todayStr();
+  const runs = getTrendingCache();
+  const hit = runs[cacheKey];
+  if (!auth.allowed) {
+    if (hit) {
+      return res.json({ ok: true, allowed: false, cached: true, niche: nicheLabel, keywords, asOf: hit.asOf, quotaUsed: hit.quotaUsed, count: hit.channels.length, channels: hit.channels.map(maskTrendingChannel), note: ACCESS_NOTE });
+    }
+    return res.json({ ok: true, allowed: false, cached: false, niche: nicheLabel, keywords, asOf: new Date().toISOString(), quotaUsed: 0, count: 0, channels: [], note: ACCESS_NOTE + ' Abhi is niche ka koi cached trending data nahi hai.' });
+  }
+  const settings = needKey(res);
+  if (!settings) return;
+  if (hit && hit.date === today && req.query.refresh !== '1') {
+    return res.json({ ok: true, allowed: true, cached: true, niche: nicheLabel, keywords, asOf: hit.asOf, quotaUsed: hit.quotaUsed, count: hit.channels.length, channels: hit.channels, note: TRENDING_PAGE_NOTE });
+  }
+  try {
+    const run = await runTrending(keywords, settings.apiKey, settings);
+    const record = { niche: nicheLabel, keywords, language: detectLangFamily(keywords.join(' ')), date: today, asOf: new Date().toISOString(), quotaUsed: run.quotaUsed, channels: run.channels };
+    runs[cacheKey] = record;
+    saveTrendingCache(runs);
+    flushSettings(settings);
+    res.json({ ok: true, allowed: true, cached: false, niche: nicheLabel, keywords, asOf: record.asOf, quotaUsed: run.quotaUsed, count: run.channels.length, channels: run.channels, note: TRENDING_PAGE_NOTE });
+  } catch (e) {
+    res.status(400).json({ ok: false, error: e.message || 'Trending nikaalte hue error aaya.' });
+  }
+});
+
 // ---------- results ----------
 app.get('/api/results', (req, res) => {
   const maps = getMaps();
@@ -1003,7 +1435,7 @@ app.get('/api/results', (req, res) => {
   let breakouts = 0;
   for (const m of maps) for (const c of m.channels) {
     const med = c.medianViews || 0;
-    if (med) breakouts += c.videos.filter(v => v.views >= med * 3).length;
+    if (med >= 100) breakouts += c.videos.filter(v => v.views >= med * 3).length;
   }
   const s = quotaResetIfNeeded(getSettings());
   res.json({
@@ -1011,6 +1443,206 @@ app.get('/api/results', (req, res) => {
       maps: maps.length, channels, videos, breakouts,
       quotaUsed: s.quotaUsed || 0, quotaLimit: QUOTA_LIMIT
     }
+  });
+});
+
+// ---------- auth routes ----------
+app.get('/api/auth/me', (req, res) => {
+  const auth = getAuth(req);
+  const store = getUsers();
+  res.json({ ok: true, loggedIn: auth.loggedIn, email: auth.email, role: auth.role, allowed: auth.allowed, setupNeeded: store.users.length === 0 });
+});
+app.post('/api/auth/setup', (req, res) => {
+  // First-run admin creation — only works while ZERO users exist.
+  const store = getUsers();
+  if (store.users.length > 0) return res.status(403).json({ ok: false, error: 'Admin pehle se bana hua hai.' });
+  const email = normEmail(req.body && req.body.email);
+  const password = String((req.body && req.body.password) || '');
+  if (!validEmail(email)) return res.status(400).json({ ok: false, error: 'Sahi email likho.' });
+  if (password.length < 8) return res.status(400).json({ ok: false, error: 'Password kam se kam 8 characters ka ho.' });
+  store.users.push({ email, password: hashPassword(password), role: 'admin', createdAt: new Date().toISOString() });
+  saveUsers(store);
+  setSessionCookie(res, email);
+  res.json({ ok: true, email, role: 'admin', allowed: true });
+});
+app.post('/api/auth/register', (req, res) => {
+  const email = normEmail(req.body && req.body.email);
+  const password = String((req.body && req.body.password) || '');
+  if (!validEmail(email)) return res.status(400).json({ ok: false, error: 'Sahi email likho.' });
+  if (password.length < 8) return res.status(400).json({ ok: false, error: 'Password kam se kam 8 characters ka ho.' });
+  const store = getUsers();
+  if (store.users.some(u => u.email === email)) return res.status(409).json({ ok: false, error: 'Is email par account pehle se hai — login karo.' });
+  store.users.push({ email, password: hashPassword(password), role: 'user', createdAt: new Date().toISOString() });
+  saveUsers(store);
+  setSessionCookie(res, email);
+  res.json({ ok: true, email, role: 'user', allowed: store.allowlist.includes(email) });
+});
+app.post('/api/auth/login', (req, res) => {
+  const email = normEmail(req.body && req.body.email);
+  const password = String((req.body && req.body.password) || '');
+  const store = getUsers();
+  const user = store.users.find(u => u.email === email);
+  if (!user || !verifyPassword(password, user.password)) return res.status(401).json({ ok: false, error: 'Email ya password ghalat hai.' });
+  setSessionCookie(res, email);
+  res.json({ ok: true, email, role: user.role, allowed: user.role === 'admin' || store.allowlist.includes(email) });
+});
+app.post('/api/auth/logout', (req, res) => { clearSessionCookie(res); res.json({ ok: true }); });
+function requireAdmin(req, res) {
+  const auth = getAuth(req);
+  if (!auth.loggedIn || auth.role !== 'admin') { res.status(403).json({ ok: false, error: 'Sirf admin ye kar sakta hai.' }); return null; }
+  return auth;
+}
+app.get('/api/auth/admin/allowlist', (req, res) => {
+  if (!requireAdmin(req, res)) return;
+  res.json({ ok: true, allowlist: getUsers().allowlist });
+});
+app.post('/api/auth/admin/allowlist', (req, res) => {
+  if (!requireAdmin(req, res)) return;
+  const email = normEmail(req.body && req.body.email);
+  if (!validEmail(email)) return res.status(400).json({ ok: false, error: 'Sahi email likho.' });
+  const store = getUsers();
+  if (!store.allowlist.includes(email)) { store.allowlist.push(email); saveUsers(store); }
+  res.json({ ok: true, allowlist: store.allowlist });
+});
+app.delete('/api/auth/admin/allowlist/:email', (req, res) => {
+  if (!requireAdmin(req, res)) return;
+  const email = normEmail(decodeURIComponent(req.params.email));
+  const store = getUsers();
+  store.allowlist = store.allowlist.filter(e => e !== email);
+  saveUsers(store);
+  res.json({ ok: true, allowlist: store.allowlist });
+});
+
+// ---------- Overview: aggregates over OUR stored data only (maps + trending scans) ----------
+// No fake numbers anywhere: every figure comes from data/maps.json and
+// data/trending.json. Periods with no data return an empty list + "no data
+// yet" on the frontend.
+function buildChannelIndex() {
+  const idx = new Map();
+  const addVideo = (e, v) => {
+    e.videos.push({
+      id: v.id, title: v.title, views: v.views || 0, publishedAt: v.publishedAt || '',
+      duration: v.duration || fmtDuration(v.durationSec || 0), durationSec: v.durationSec || 0,
+      thumbnail: v.thumbnail || '', channelId: e.id, channelTitle: e.title,
+      channelThumbnail: e.thumbnail, subs: e.subs
+    });
+  };
+  for (const m of getMaps()) {
+    for (const c of (m.channels || [])) {
+      const e = idx.get(c.id) || { id: c.id, title: c.title || '', thumbnail: c.thumbnail || '', subs: c.subs || 0, publishedAt: c.publishedAt || '', medianViews: c.medianViews || 0, videos: [] };
+      if (!e.medianViews && c.medianViews) e.medianViews = c.medianViews;
+      for (const v of (c.videos || [])) addVideo(e, v);
+      idx.set(c.id, e);
+    }
+  }
+  for (const run of Object.values(getTrendingCache())) {
+    for (const c of (run.channels || [])) {
+      const cid = c.channelId || c.id;
+      const e = idx.get(cid) || { id: cid, title: c.title || '', thumbnail: c.thumbnail || '', subs: c.subs || 0, publishedAt: c.channelPublishedAt || '', medianViews: c.medianViews || 0, videos: [] };
+      if (!e.medianViews && c.medianViews) e.medianViews = c.medianViews;
+      for (const v of (c.videos || [])) addVideo(e, v);
+      idx.set(cid, e);
+    }
+  }
+  // Dedupe videos per channel (same video can appear in a map AND a trending run).
+  for (const e of idx.values()) {
+    const seen = new Set();
+    e.videos = e.videos.filter(v => { if (seen.has(v.id)) return false; seen.add(v.id); return true; });
+  }
+  return idx;
+}
+function channelStats(e) {
+  // Median: prefer the channel's stored medianViews (computed from its recent
+  // videos at scan time). Falling back to the median of the 1–3 stored videos
+  // would give a trending-only channel a multiple of 1.0× — meaningless.
+  const med = (e.medianViews && e.medianViews > 0) ? e.medianViews : median(e.videos.map(v => v.views));
+  const avg = e.videos.length ? Math.round(e.videos.reduce((a, v) => a + v.views, 0) / e.videos.length) : 0;
+  let bestMultiple = null, bestPublishedAt = '', bestViews = 0;
+  for (const v of e.videos) {
+    const m = med >= 100 ? +(v.views / med).toFixed(1) : null;
+    if (m !== null && (bestMultiple === null || m > bestMultiple)) { bestMultiple = m; bestPublishedAt = v.publishedAt; }
+    if (v.views > bestViews) bestViews = v.views;
+  }
+  const ageDays = e.publishedAt ? Math.max(1, Math.round((Date.now() - new Date(e.publishedAt).getTime()) / 86400000)) : null;
+  return { ageDays, avgViews: avg, videoCount: e.videos.length, medianViews: med, bestMultiple, bestPublishedAt, bestViews };
+}
+function vphOf(v) {
+  const t = new Date(v.publishedAt).getTime();
+  if (!t) return null;
+  const hours = Math.max(1, (Date.now() - t) / 3600000);
+  return Math.round((v.views / hours) * 10) / 10;
+}
+
+app.get('/api/overview', (req, res) => {
+  const auth = getAuth(req);
+  const window = req.query.window || '24h';
+  const viralWindow = req.query.viralWindow || '30d';
+  const winMs = { '24h': 86400000, '7d': 7 * 86400000, '30d': 30 * 86400000, '90d': 90 * 86400000 }[window] || 86400000;
+  const viralMs = { '24h': 86400000, '7d': 7 * 86400000, '30d': 30 * 86400000, 'all': Infinity }[viralWindow] || 30 * 86400000;
+  const now = Date.now();
+  const idx = buildChannelIndex();
+  const maps = getMaps();
+  const runs = getTrendingCache();
+  // Total Channels Analyzed = unique channels in OUR stored data (maps +
+  // trending scans). Never any copied number.
+  const totalChannels = idx.size;
+  const today = todayStr();
+  const todayIds = new Set();
+  for (const m of maps) if ((m.createdAt || '').slice(0, 10) === today) for (const c of (m.channels || [])) todayIds.add(c.id);
+  for (const run of Object.values(runs)) if ((run.asOf || '').slice(0, 10) === today) for (const c of (run.channels || [])) todayIds.add(c.channelId || c.id);
+  const todayAdded = todayIds.size;
+  // Recently Added Outlier Channels: trending runs from the last 24h.
+  const recent = [];
+  for (const run of Object.values(runs)) {
+    if (!run.asOf || now - new Date(run.asOf).getTime() > 86400000) continue;
+    for (const c of (run.channels || [])) {
+      recent.push({
+        id: c.channelId || c.id, title: c.title || '', thumbnail: c.thumbnail || '',
+        subs: c.subs || 0, ageDays: c.ageDays || null, medianViews: c.medianViews || 0,
+        bestMultiple: c.bestMultiple == null ? null : c.bestMultiple, bestViews: c.bestViews || 0,
+        language: run.language || 'unknown', niche: run.niche || ''
+      });
+    }
+  }
+  recent.sort((a, b) => (b.bestMultiple || -1) - (a.bestMultiple || -1) || b.bestViews - a.bestViews);
+  // Niches with High Future Competition: channels whose BEST video falls in
+  // the selected window. Avg views = mean of the channel's stored videos.
+  const competition = [];
+  for (const e of idx.values()) {
+    const s = channelStats(e);
+    if (s.bestMultiple === null || !s.bestPublishedAt) continue;
+    if (now - new Date(s.bestPublishedAt).getTime() > winMs) continue;
+    competition.push({
+      id: e.id, title: e.title, thumbnail: e.thumbnail, subs: e.subs,
+      ageDays: s.ageDays, avgViews: s.avgViews, videoCount: s.videoCount,
+      medianViews: s.medianViews, bestMultiple: s.bestMultiple, bestViews: s.bestViews,
+      bestPublishedAt: s.bestPublishedAt
+    });
+  }
+  competition.sort((a, b) => b.bestMultiple - a.bestMultiple || b.bestViews - a.bestViews);
+  // Viral Videos On Small Channels: subs < 100,000, published in the viral window.
+  const viral = [];
+  for (const e of idx.values()) {
+    if ((e.subs || 0) >= 100000) continue;
+    for (const v of e.videos) {
+      const t = new Date(v.publishedAt).getTime();
+      if (!t || now - t > viralMs) continue;
+      viral.push({ ...v, vph: vphOf(v) });
+    }
+  }
+  viral.sort((a, b) => b.views - a.views);
+  const allowed = auth.allowed;
+  res.json({
+    ok: true, allowed, accessNote: allowed ? '' : ACCESS_NOTE,
+    asOf: new Date().toISOString(),
+    totalChannels, todayAdded,
+    mapsBuilt: maps.length, trendingRuns: Object.keys(runs).length,
+    videosStored: [...idx.values()].reduce((a, e) => a + e.videos.length, 0),
+    recentOutliers: (allowed ? recent : recent.map(maskChannelRow)).slice(0, 20),
+    competition: (allowed ? competition : competition.map(maskChannelRow)).slice(0, 20),
+    viralVideos: (allowed ? viral : viral.map(maskVideoCard)).slice(0, 24),
+    windows: { window, viralWindow },
+    note: 'Ye saara data hamare apne maps aur trending scans se hai — koi fake number nahi. Avg views = stored videos ki average.'
   });
 });
 
@@ -1048,4 +1680,8 @@ function startServer(port, attemptsLeft) {
     }
   });
 }
-startServer(PORT, 5);
+// Only auto-start when run directly (node server.js / pkg exe). Tests can
+// require() this file and use the exported helpers without starting a server.
+ensureAdminFromEnv();
+if (require.main === module) startServer(PORT, 5);
+module.exports = { app, tokenize, detectLangFamily, deriveNiche, nicheTest, median, ensureAdminFromEnv, getAuth, buildChannelIndex, vphOf };
