@@ -3,6 +3,16 @@
 // masked data (names "•••", numbers null) — the blur here is cosmetic only.
 const $ = s => document.querySelector(s);
 let me = null, ov = null;
+function ytWatch(id) { return id ? 'https://www.youtube.com/watch?v=' + encodeURIComponent(id) : null; }
+function ytChannel(id, customUrl) {
+  if (customUrl && String(customUrl).trim().startsWith('@')) return 'https://www.youtube.com/' + String(customUrl).trim();
+  return id ? 'https://www.youtube.com/channel/' + encodeURIComponent(id) : null;
+}
+function linkOrText(url, inner, cls) {
+  return url ? `<a class="${cls || 'yt-link'}" href="${url}" target="_blank" rel="noopener">${inner}</a>` : inner;
+}
+const SKEL_ROWS = '<div class="skel-row"><i class="skel skel-dp"></i><i class="skel skel-line" style="width:55%"></i><i class="skel skel-line" style="width:18%"></i></div><div class="skel-row"><i class="skel skel-dp"></i><i class="skel skel-line" style="width:45%"></i><i class="skel skel-line" style="width:22%"></i></div><div class="skel-row"><i class="skel skel-dp"></i><i class="skel skel-line" style="width:60%"></i><i class="skel skel-line" style="width:15%"></i></div>';
+const SKEL_CARDS = '<div class="vgrid"><div class="skel-card"><i class="skel skel-thumb"></i><i class="skel skel-line" style="width:80%"></i><i class="skel skel-line" style="width:55%"></i></div><div class="skel-card"><i class="skel skel-thumb"></i><i class="skel skel-line" style="width:70%"></i><i class="skel skel-line" style="width:50%"></i></div><div class="skel-card"><i class="skel skel-thumb"></i><i class="skel skel-line" style="width:85%"></i><i class="skel skel-line" style="width:45%"></i></div></div>';
 let compWindow = '24h', viralWindow = '30d', langFilter = 'all';
 let viralList = [];
 
@@ -42,9 +52,18 @@ async function loadMe() {
   $('#greeting').innerHTML = me.loggedIn ? `Welcome, <b>${me.email}</b>!` : 'Welcome, <b>Guest</b>!';
   $('#loginBtn').classList.toggle('hidden', me.loggedIn);
   $('#logoutBtn').classList.toggle('hidden', !me.loggedIn);
-  $('#setupCard').classList.toggle('hidden', !me.setupNeeded);
-  $('#adminPanel').classList.toggle('hidden', me.role !== 'admin');
-  if (me.role === 'admin') loadAllowlist();
+  const tc = $('#tokenChip');
+  if (tc) {
+    if (me.loggedIn) {
+      try {
+        const b = await api('/api/billing/me');
+        tc.classList.remove('hidden');
+        tc.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v10M15 9.5c0-1.4-1.3-2.5-3-2.5s-3 1.1-3 2.5 1 2 3 2.5 3 1.1 3 2.5-1.3 2.5-3 2.5-3-1.1-3-2.5"/></svg><a href="/pricing.html">${fmt(b.balance)} tokens · ${b.planName}</a>`;
+      } catch (e) { tc.classList.add('hidden'); }
+    } else {
+      tc.classList.add('hidden');
+    }
+  }
 }
 $('#loginBtn').onclick = () => { $('#authModal').classList.remove('hidden'); };
 $('#logoutBtn').onclick = async () => { await api('/api/auth/logout', { method: 'POST' }); location.reload(); };
@@ -68,48 +87,18 @@ $('#authSubmit').onclick = async () => {
     const r = await api('/api/auth/' + authMode, { method: 'POST', body: JSON.stringify({ email, password: pass }) });
     $('#authModal').classList.add('hidden');
     await loadMe(); await loadOverview();
-    if (!r.allowed) alert('Login ho gaya — lekin aapki email allowlist mein nahi hai, is liye data blurred dikhega. Access ke liye admin se rabta karo.');
+    if (!r.allowed) alert('Logged in — but your email does not have access yet, so data stays blurred. Contact the site owner for access.');
   } catch (e) { setMsg($('#authMsg'), e.message); }
 };
-$('#setupBtn').onclick = async () => {
-  try {
-    await api('/api/auth/setup', { method: 'POST', body: JSON.stringify({ email: $('#setupEmail').value.trim(), password: $('#setupPass').value }) });
-    location.reload();
-  } catch (e) { setMsg($('#setupMsg'), e.message); }
-};
-
-// ---------- admin: allowlist ----------
-async function loadAllowlist() {
-  try {
-    const r = await api('/api/auth/admin/allowlist');
-    $('#allowList').innerHTML = r.allowlist.length ? r.allowlist.map(e => `
-      <div class="allow-row"><span>${e}</span><button class="btn small danger" data-del="${e}">Remove</button></div>`).join('')
-      : '<p class="muted">Allowlist khaali hai — kisi ko bhi unblurred data nahi dikhega.</p>';
-    $('#allowList').querySelectorAll('[data-del]').forEach(b => b.onclick = async () => {
-      await api('/api/auth/admin/allowlist/' + encodeURIComponent(b.dataset.del), { method: 'DELETE' });
-      loadAllowlist(); loadOverview();
-    });
-  } catch (e) { setMsg($('#allowMsg'), e.message); }
-}
-$('#allowAddBtn').onclick = async () => {
-  const email = $('#allowEmail').value.trim();
-  if (!email) return;
-  try {
-    const r = await api('/api/auth/admin/allowlist', { method: 'POST', body: JSON.stringify({ email }) });
-    $('#allowEmail').value = '';
-    setMsg($('#allowMsg'), 'Added: ' + email, true);
-    $('#allowList').innerHTML = r.allowlist.map(e => `
-      <div class="allow-row"><span>${e}</span><button class="btn small danger" data-del="${e}">Remove</button></div>`).join('');
-    loadAllowlist(); loadOverview();
-  } catch (e) { setMsg($('#allowMsg'), e.message); }
-};
-
 // ---------- overview data ----------
 async function loadOverview() {
+  document.getElementById('recentBody').innerHTML = SKEL_ROWS;
+  document.getElementById('compBody').innerHTML = SKEL_ROWS;
+  document.getElementById('viralBody').innerHTML = SKEL_CARDS;
   const r = await api(`/api/overview?window=${compWindow}&viralWindow=${viralWindow}`);
   ov = r;
   $('#statTotal').innerHTML = fmt(r.totalChannels) + (r.todayAdded ? ` <small>+${fmt(r.todayAdded)} today</small>` : '');
-  $('#statToday').textContent = r.todayAdded ? `+${r.todayAdded} channels aaj add hue` : 'Aaj koi naya channel add nahi hua';
+  $('#statToday').textContent = r.todayAdded ? `+${r.todayAdded} channels added today` : 'No new channels added today';
   $('#statMaps').textContent = fmt(r.mapsBuilt);
   $('#statRuns').textContent = fmt(r.trendingRuns);
   $('#statVideos').textContent = fmt(r.videosStored);
@@ -118,7 +107,7 @@ async function loadOverview() {
     banner.classList.add('hidden');
   } else {
     banner.classList.remove('hidden');
-    banner.innerHTML = `<b>🔒 Limited view.</b> ${r.accessNote} ${me && me.loggedIn ? 'Aapki email allowlist mein nahi hai.' : 'Login karo — ye data sirf allowed users ko dikhta hai.'}`;
+    banner.innerHTML = `<b>Limited view.</b> ${r.accessNote} ${me && me.loggedIn ? 'Your email does not have access yet.' : 'Log in — this data is only visible to users with access.'}`;
   }
   for (const id of ['recentBody', 'compBody', 'viralBody']) {
     document.getElementById(id).classList.toggle('masked', !r.allowed);
@@ -150,14 +139,14 @@ function renderRecent() {
   const list = (ov.recentOutliers || []).filter(c => langFilter === 'all' || c.language === langFilter);
   const body = $('#recentBody');
   if (!list.length) {
-    body.innerHTML = '<p class="muted">Pichle 24h mein koi naya outlier channel nahi mila. Pehle Trending 24h chalao (allowed users ke liye) — ya koi aur language filter try karo.</p>';
+    body.innerHTML = '<p class="muted">No new outlier channels in the last 24h. Run Trending 24h first — or try a different language filter.</p>';
     return;
   }
   const maxM = Math.max(...list.map(c => c.bestMultiple || 0), 1);
   body.innerHTML = list.map(c => `
     <div class="orow">
       ${dpHtml(c.thumbnail, c.title)}
-      <div class="grow"><div class="t">${c.title}</div><div class="m">${c.subs == null ? '—' : fmt(c.subs) + ' subscribers'}${c.ageDays ? ' · ' + c.ageDays + ' days old' : ''}</div></div>
+      <div class="grow"><div class="t">${linkOrText(ytChannel(c.id), c.title)}</div><div class="m">${c.subs == null ? '—' : fmt(c.subs) + ' subscribers'}${c.ageDays ? ' · ' + c.ageDays + ' days old' : ''}</div></div>
       <div class="obar"><i style="width:${c.bestMultiple == null ? 0 : Math.max(4, Math.round(c.bestMultiple / maxM * 100))}%"></i></div>
       <span class="mult">${c.bestMultiple == null ? '—' : c.bestMultiple + '×'}</span>
     </div>`).join('');
@@ -166,14 +155,14 @@ function renderCompetition() {
   const list = ov.competition || [];
   const body = $('#compBody');
   if (!list.length) {
-    body.innerHTML = `<p class="muted">Is period (${compWindow}) ke liye hamare paas data nahi hai — no data yet. Koi fake number nahi dikhaya ja raha; map banao ya Trending chalao to ye bhar jayega.</p>`;
+    body.innerHTML = `<p class="muted">No data for this period (${compWindow}) yet — no made-up numbers are shown. Build a map or run Trending and this will fill in.</p>`;
     return;
   }
   body.innerHTML = `
     <div class="comp-cols"><span>Channel</span><span>Subs</span><span>Avg views</span><span class="hide-m">Videos</span><span class="hide-m">Days</span><span>Outlier</span></div>` +
     list.map(c => `
     <div class="comp-row">
-      <div class="cell chan-cell">${dpHtml(c.thumbnail, c.title)}<span class="t">${c.title}</span></div>
+      <div class="cell chan-cell">${linkOrText(ytChannel(c.id), dpHtml(c.thumbnail, c.title), 'dp-link')}<span class="t">${linkOrText(ytChannel(c.id), c.title)}</span></div>
       <div class="cell">${c.subs == null ? '—' : fmt(c.subs)}</div>
       <div class="cell">${c.avgViews == null ? '—' : fmt(c.avgViews)}</div>
       <div class="cell hide-m">${c.videoCount == null ? '—' : c.videoCount}</div>
@@ -188,18 +177,22 @@ function renderViral() {
 function renderViralGrid() {
   const body = $('#viralBody');
   if (!viralList.length) {
-    body.innerHTML = '<p class="muted">Is window mein koi viral video nahi mili (small channels &lt; 100K subs). Map banao ya Trending chalao to videos yahan aayengi.</p>';
+    body.innerHTML = '<p class="muted">No viral videos in this window (small channels &lt; 100K subscribers, 100,000+ views). Build a map or run Trending and videos will appear here.</p>';
     return;
   }
-  body.innerHTML = `<div class="vgrid">` + viralList.map(v => `
+  body.innerHTML = `<div class="vgrid">` + viralList.map(v => {
+    const watch = ytWatch(v.id);
+    const chan = ytChannel(v.channelId);
+    return `
     <div class="vcard">
-      <div class="vthumb">${v.thumbnail ? `<img src="/api/thumb?u=${encodeURIComponent(v.thumbnail)}" onerror="this.style.display='none'">` : ''}<span class="vdur">${v.duration || '—'}</span></div>
+      <div class="vthumb">${watch && v.thumbnail ? `<a href="${watch}" target="_blank" rel="noopener"><img src="/api/thumb?u=${encodeURIComponent(v.thumbnail)}" onerror="this.style.display='none'"></a>` : (v.thumbnail ? `<img src="/api/thumb?u=${encodeURIComponent(v.thumbnail)}" onerror="this.style.display='none'">` : '')}<span class="vdur">${v.duration || '—'}</span></div>
       <div class="vbody">
-        <div class="t">${v.title}</div>
-        <div class="vchan">${dpHtml(v.channelThumbnail, v.channelTitle)}<span>${v.channelTitle}</span></div>
+        <div class="t">${linkOrText(watch, v.title)}</div>
+        <div class="vchan">${chan ? `<a href="${chan}" target="_blank" rel="noopener">${dpHtml(v.channelThumbnail, v.channelTitle)}</a>` : dpHtml(v.channelThumbnail, v.channelTitle)}<span>${linkOrText(chan, v.channelTitle)}</span></div>
         <div class="vmeta">${v.views == null ? '—' : fmt(v.views) + ' views'} · ${ago(v.publishedAt)}<br>VPH: <b>${v.vph == null ? '—' : fmt(v.vph) + '/hr'}</b> · ${v.subs == null ? '—' : fmt(v.subs) + ' subs'}</div>
       </div>
-    </div>`).join('') + `</div>`;
+    </div>`;
+  }).join('') + `</div>`;
 }
 
 // ---------- init ----------

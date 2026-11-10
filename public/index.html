@@ -10,47 +10,27 @@
 <aside class="sidebar">
   <div class="brand"><span class="logo">◎</span> ChannelScope</div>
   <nav class="side-nav">
-    <a href="/" class="active">Overview</a>
-    <a href="/app.html#map">Map</a>
-    <a href="/app.html#breakouts">Breakouts</a>
-    <a href="/app.html#topics">Topics</a>
-    <a href="/app.html#mapchat">Map chat</a>
-    <a href="/app.html#trending">Trending 24h</a>
-    <a href="/app.html#results">Results</a>
+    <a href="/" class="active"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="9" rx="1.5"/><rect x="14" y="3" width="7" height="5" rx="1.5"/><rect x="14" y="12" width="7" height="9" rx="1.5"/><rect x="3" y="16" width="7" height="5" rx="1.5"/></svg>Overview</a>
+    <a href="/app.html#map"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="4.5"/><circle cx="12" cy="12" r="1" fill="currentColor"/></svg>Map</a>
+    <a href="/app.html#breakouts"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 17l6-6 4 4 8-8"/><path d="M15 7h6v6"/></svg>Breakouts</a>
+    <a href="/app.html#topics"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18h6M10 21h4"/><path d="M12 3a6 6 0 0 0-4 10.5c.8.7 1 1.5 1 2.5h6c0-1 .2-1.8 1-2.5A6 6 0 0 0 12 3z"/></svg>Topics</a>
+    <a href="/app.html#mapchat"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 11.5a8.5 8.5 0 0 1-12.4 7.5L3 21l2-5.6A8.5 8.5 0 1 1 21 11.5z"/></svg>Map chat</a>
+    <a href="/app.html#trending"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2L4.5 13.5H11L9.5 22 19 10h-6.5L13 2z"/></svg>Trending 24h</a>
+    <a href="/app.html#results"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v18h18"/><path d="M7 15v3M12 10v8M17 6v12"/></svg>Results</a>
+    <a href="/pricing.html"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v10M15 9.5c0-1.4-1.3-2.5-3-2.5s-3 1.1-3 2.5 1 2 3 2.5 3 1.1 3 2.5-1.3 2.5-3 2.5-3-1.1-3-2.5"/></svg>Pricing</a>
   </nav>
-  <div class="side-foot" id="sideFoot">YouTube competitor map — apni API key se.</div>
+  <div class="side-foot" id="sideFoot">YouTube competitor map — find what to make next. · <a href="/privacy">Privacy Policy</a></div>
 </aside>
 
 <main class="main">
   <div class="topbar">
     <h1>Overview</h1>
+    <span class="tokenchip hidden" id="tokenChip"></span>
     <span class="userchip" id="userChip">Guest</span>
     <button class="btn" id="loginBtn">Login</button>
     <button class="btn hidden" id="logoutBtn">Logout</button>
   </div>
   <p class="greet" id="greeting">Welcome, Guest!</p>
-
-  <div id="setupCard" class="card hidden">
-    <h2 style="margin-top:0">Pehli dafa setup — admin account banao</h2>
-    <p class="muted">Abhi koi admin nahi hai. Pehla account admin banega (Kamran). Email + password (8+ characters) likho.</p>
-    <div class="row">
-      <input type="email" id="setupEmail" placeholder="admin email" style="flex:1;min-width:200px">
-      <input type="password" id="setupPass" placeholder="password (8+ chars)" style="flex:1;min-width:180px">
-      <button class="btn primary" id="setupBtn">Create admin</button>
-    </div>
-    <div id="setupMsg"></div>
-  </div>
-
-  <div id="adminPanel" class="card hidden">
-    <h2 style="margin-top:0">Admin — allowed emails</h2>
-    <p class="muted">Sirf in emails wale users ko Overview / Trending data unblurred dikhega. Baqi sab ko blurred + masked data.</p>
-    <div class="row">
-      <input type="email" id="allowEmail" placeholder="email add karo" style="flex:1;min-width:200px">
-      <button class="btn primary" id="allowAddBtn">Add</button>
-    </div>
-    <div id="allowList" style="margin-top:10px"></div>
-    <div id="allowMsg"></div>
-  </div>
 
   <div id="accessBanner" class="access-banner hidden"></div>
 
@@ -63,7 +43,7 @@
     <div class="stat">
       <div class="label">Maps built</div>
       <div class="num" id="statMaps" style="font-size:26px">—</div>
-      <div class="sub">hamare maps se</div>
+      <div class="sub">from our maps</div>
     </div>
     <div class="stat">
       <div class="label">Trending runs</div>
@@ -73,10 +53,10 @@
     <div class="stat">
       <div class="label">Videos stored</div>
       <div class="num" id="statVideos" style="font-size:26px">—</div>
-      <div class="sub">maps + trending scans se</div>
+      <div class="sub">from maps + trending scans</div>
     </div>
   </section>
-  <p class="muted" style="margin:-8px 0 18px;font-size:13px">Ye saare counts hamare apne maps aur trending scans se hain — koi bahari number nahi.</p>
+  <p class="muted" style="margin:-8px 0 18px;font-size:13px">All counts come from our own maps and trending scans — no external numbers.</p>
 
   <section class="panels">
     <div class="panel">
@@ -87,22 +67,22 @@
           <option value="all">All languages</option>
         </select>
       </div>
-      <p class="sub">Pichle 24h ke trending scans se naye channels (30–60 din purane, 1000+ subs, views 100,000+).</p>
-      <div class="panel-body" id="recentBody"><p class="muted">Loading…</p></div>
+      <p class="sub">New channels from the last 24 hours of trending scans (30–60 days old, 1,000+ subscribers, 100,000+ views).</p>
+      <div class="panel-body" id="recentBody"><div class="skel-row"><i class="skel skel-dp"></i><i class="skel skel-line" style="width:55%"></i><i class="skel skel-line" style="width:18%"></i></div><div class="skel-row"><i class="skel skel-dp"></i><i class="skel skel-line" style="width:45%"></i><i class="skel skel-line" style="width:22%"></i></div><div class="skel-row"><i class="skel skel-dp"></i><i class="skel skel-line" style="width:60%"></i><i class="skel skel-line" style="width:15%"></i></div></div>
     </div>
 
     <div class="panel">
       <div class="panel-head">
         <h2>Niches with High Future Competition</h2>
       </div>
-      <p class="sub">Channels jinki best video is period mein outlier rahi — hamare stored data se. Avg views = stored videos ki average.</p>
+      <p class="sub">Channels whose best video was an outlier in this period — from our stored data. Avg views = average of stored videos.</p>
       <div class="tabs" id="compTabs" style="margin-bottom:10px">
         <button class="tab active" data-window="24h">Last 24 Hours</button>
         <button class="tab" data-window="7d">7 Days</button>
         <button class="tab" data-window="30d">30 Days</button>
         <button class="tab" data-window="90d">90 Days</button>
       </div>
-      <div class="panel-body" id="compBody"><p class="muted">Loading…</p></div>
+      <div class="panel-body" id="compBody"><div class="skel-row"><i class="skel skel-dp"></i><i class="skel skel-line" style="width:50%"></i><i class="skel skel-line" style="width:20%"></i></div><div class="skel-row"><i class="skel skel-dp"></i><i class="skel skel-line" style="width:40%"></i><i class="skel skel-line" style="width:25%"></i></div><div class="skel-row"><i class="skel skel-dp"></i><i class="skel skel-line" style="width:58%"></i><i class="skel skel-line" style="width:16%"></i></div></div>
     </div>
   </section>
 
@@ -114,10 +94,10 @@
         <option value="7d">Last 7 Days</option>
         <option value="30d" selected>Last 30 Days</option>
       </select>
-      <button class="btn small" id="randomBtn">🎲 Random</button>
+      <button class="btn small" id="randomBtn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 3h5v5M4 20L21 3M21 16v5h-5M15 15l6 6M4 4l5 5"/></svg>Random</button>
     </div>
-    <p class="sub">Small channels (subs &lt; 100,000) ki viral videos — hamare maps aur trending scans se. VPH = views per hour (views ÷ publish hone se ab tak ke hours). Cards views ke hisaab se sorted hain.</p>
-    <div class="panel-body" id="viralBody"><p class="muted">Loading…</p></div>
+    <p class="sub">Viral videos from small channels (under 100,000 subscribers, 100,000+ views) — from our maps and trending scans. VPH = views per hour (views ÷ hours since published). Cards are sorted by views. Click a card to open the video on YouTube.</p>
+    <div class="panel-body" id="viralBody"><div class="vgrid"><div class="skel-card"><i class="skel skel-thumb"></i><i class="skel skel-line" style="width:80%"></i><i class="skel skel-line" style="width:55%"></i></div><div class="skel-card"><i class="skel skel-thumb"></i><i class="skel skel-line" style="width:70%"></i><i class="skel skel-line" style="width:50%"></i></div><div class="skel-card"><i class="skel skel-thumb"></i><i class="skel skel-line" style="width:85%"></i><i class="skel skel-line" style="width:45%"></i></div></div></div>
   </section>
 </main>
 
@@ -137,7 +117,7 @@
       <button class="btn primary" id="authSubmit" style="flex:1">Login</button>
       <button class="btn" id="authCancel">Cancel</button>
     </div>
-    <p class="muted" style="font-size:13px;margin-top:12px">Register karne se account banta hai — unblurred data sirf tab milega jab admin aapki email allowlist mein daale.</p>
+    <p class="muted" style="font-size:13px;margin-top:12px">Registering creates an account — full unblurred data is only available if the site owner grants your email access. · <a href="/privacy">Privacy Policy</a></p>
   </div>
 </div>
 

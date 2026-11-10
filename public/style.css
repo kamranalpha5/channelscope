@@ -149,3 +149,8 @@ footer{max-width:1060px;margin:40px auto 30px;padding:0 16px;color:var(--muted);
   *,*::before,*::after{animation-duration:.01ms!important;animation-iteration-count:1!important;transition-duration:.01ms!important}
   html{scroll-behavior:auto}
 }
+
+/* ---------- token chip (v1.3.1) ---------- */
+.tokenchip{display:inline-flex;align-items:center;gap:6px;background:#12365e;border:1px solid var(--line);border-radius:999px;padding:5px 12px;font-size:13px;font-weight:600;color:var(--amber);white-space:nowrap}
+.tokenchip svg{width:15px;height:15px;flex:none}
+.tokenchip a{color:var(--amber)}

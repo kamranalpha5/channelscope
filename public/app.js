@@ -12,8 +12,56 @@ const TRENDING_PAGE_SIZE = 10;
 async function api(path, opts) {
   const r = await fetch(path, Object.assign({ headers: { 'Content-Type': 'application/json' } }, opts || {}));
   const data = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error(data.error || ('Request failed (' + r.status + ')'));
+  if (!r.ok) {
+    const err = new Error(data.error || ('Request failed (' + r.status + ')'));
+    err.data = data; // carries .yt {status, reason, message} when the server knows it
+    err.status = r.status;
+    throw err;
+  }
   return data;
+}
+// Auth state (tokens: builds/scans need a logged-in user with tokens).
+let me = null;
+let authMode = 'login';
+function openAuthModal() { $('#authModal').classList.remove('hidden'); }
+function closeAuthModal() { $('#authModal').classList.add('hidden'); }
+function setAuthMode(mode) {
+  authMode = mode;
+  $('#tabLogin').classList.toggle('active', mode === 'login');
+  $('#tabRegister').classList.toggle('active', mode === 'register');
+  $('#authTitle').textContent = mode === 'login' ? 'Login' : 'Register';
+  $('#authSubmit').textContent = mode === 'login' ? 'Login' : 'Register';
+  setStatus($('#authMsg'), '');
+}
+$('#loginBtn').onclick = openAuthModal;
+$('#logoutBtn').onclick = async () => { await api('/api/auth/logout', { method: 'POST' }); me = null; loadStatus(); };
+$('#authCancel').onclick = closeAuthModal;
+$('#authModal').onclick = e => { if (e.target.id === 'authModal') closeAuthModal(); };
+$('#tabLogin').onclick = () => setAuthMode('login');
+$('#tabRegister').onclick = () => setAuthMode('register');
+$('#authSubmit').onclick = async () => {
+  const email = $('#authEmail').value.trim();
+  const pass = $('#authPass').value;
+  try {
+    const r = await api('/api/auth/' + authMode, { method: 'POST', body: JSON.stringify({ email, password: pass }) });
+    closeAuthModal();
+    await loadStatus();
+    if (!r.allowed) setStatus($('#buildStatus'), 'Logged in — but your email is not on the access list, so Overview data stays blurred. You can still build maps with tokens.', 'err');
+  } catch (e) { setStatus($('#authMsg'), e.message, 'err'); }
+};
+// Subscriber counts: null (hidden/unknown) renders as "—", never as 0.
+function fmtSubs(n) { return (n == null || n === 0) ? '—' : fmt(n); }
+function ytWatch(id) { return id ? 'https://www.youtube.com/watch?v=' + encodeURIComponent(id) : null; }
+function ytChannel(id, customUrl) {
+  if (customUrl && String(customUrl).trim().startsWith('@')) return 'https://www.youtube.com/' + String(customUrl).trim();
+  return id ? 'https://www.youtube.com/channel/' + encodeURIComponent(id) : null;
+}
+function linkOrText(url, inner, cls) {
+  return url ? `<a class="${cls || 'yt-link'}" href="${url}" target="_blank" rel="noopener">${inner}</a>` : inner;
+}
+function ytErrText(e) {
+  const y = e && e.data && e.data.yt;
+  return y ? ` (YouTube: ${y.status || ''} ${y.reason || ''} — ${y.message || ''})`.trim() : '';
 }
 function fmt(n) { return (+n || 0).toLocaleString(); }
 // Thumbnails load through the server (same origin) — cross-origin yt3 images
@@ -47,31 +95,32 @@ async function loadStatus() {
   try {
     const s = await api('/api/status');
     hasKey = s.hasKey;
+    me = s.me || null;
     $('#quotaUsed').textContent = fmt(s.quotaUsed);
-    $('#keyWarn').classList.toggle('hidden', hasKey);
-    $('#removeKeyBtn').classList.toggle('hidden', !hasKey);
-    $('#apiKeyInput').value = '';
-    $('#apiKeyInput').placeholder = hasKey ? 'Key saved ✓ (change karne ke liye nayi key paste karo)' : 'AIzaSy... (apni key yahan paste karo)';
+    const chip = $('#userChip');
+    if (chip) chip.textContent = me && me.loggedIn ? me.email : 'Guest';
+    $('#loginBtn').classList.toggle('hidden', !!(me && me.loggedIn));
+    $('#logoutBtn').classList.toggle('hidden', !(me && me.loggedIn));
+    const ql = $('#quotaLimits');
+    if (ql) {
+      const searchInfo = ` · Search calls used today: ${fmt(s.searchUsed || 0)} / ${fmt(s.searchLimit || 100)}`;
+      if (me && me.loggedIn && s.tokens) {
+        ql.innerHTML = ` · <a class="yt-link" href="/pricing.html">${fmt(s.tokens.balance)} tokens</a> · ${fmt(s.tokens.freeLeft)} free left today · ${s.tokens.planName} plan · ${fmt(s.quotaRemaining)} units remaining${searchInfo}`;
+      } else {
+        ql.textContent = ' · Log in to build maps.' + searchInfo;
+      }
+    }
+    const tc = $('#tokenChip');
+    if (tc) {
+      if (me && me.loggedIn && s.tokens) {
+        tc.classList.remove('hidden');
+        tc.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v10M15 9.5c0-1.4-1.3-2.5-3-2.5s-3 1.1-3 2.5 1 2 3 2.5 3 1.1 3 2.5-1.3 2.5-3 2.5-3-1.1-3-2.5"/></svg><a href="/pricing.html">${fmt(s.tokens.balance)} tokens · ${s.tokens.planName}</a>`;
+      } else {
+        tc.classList.add('hidden');
+      }
+    }
   } catch (e) { /* server down */ }
 }
-$('#saveKeyBtn').onclick = async () => {
-  const key = $('#apiKeyInput').value.trim();
-  if (!key) return setStatus($('#keyStatus'), 'Key paste karo pehle.', 'err');
-  setStatus($('#keyStatus'), 'Key check ho rahi hai…');
-  try {
-    const r = await api('/api/settings/key', { method: 'POST', body: JSON.stringify({ key }) });
-    setStatus($('#keyStatus'), r.message, 'ok');
-    loadStatus(); loadResults();
-  } catch (e) { setStatus($('#keyStatus'), e.message, 'err'); }
-};
-$('#removeKeyBtn').onclick = async () => {
-  await api('/api/settings/key', { method: 'DELETE' });
-  setStatus($('#keyStatus'), 'Key remove kar di.', 'ok');
-  loadStatus();
-};
-$('#keyBtn').onclick = () => { $('#keySection').scrollIntoView({ behavior: 'smooth' }); $('#apiKeyInput').focus(); };
-$('#keyWarnBtn').onclick = () => { $('#keySection').scrollIntoView({ behavior: 'smooth' }); $('#apiKeyInput').focus(); };
-
 // ---------- depth slider ----------
 const DEPTHS = { 1: 'Depth 1 · up to ~16 channels', 2: 'Depth 2 · up to ~70 channels', 3: 'Depth 4 · up to ~273 channels' };
 $('#depthSlider').oninput = e => { $('#depthLabel').textContent = DEPTHS[e.target.value]; };
@@ -79,10 +128,10 @@ function depthValue() { return { 1: 1, 2: 2, 3: 4 }[$('#depthSlider').value]; }
 
 // ---------- map build (progressive) ----------
 $('#buildBtn').onclick = async () => {
-  if (!hasKey) { $('#keySection').scrollIntoView({ behavior: 'smooth' }); return setStatus($('#buildStatus'), 'Pehle API key save karo.', 'err'); }
+  if (!me || !me.loggedIn) { setStatus($('#buildStatus'), 'Please log in to build maps.', 'err'); openAuthModal(); return; }
   const input = $('#seedInput').value.trim();
-  if (!input) return setStatus($('#buildStatus'), 'Seed channel likho (jaise @EconomyPuzzle).', 'err');
-  setStatus($('#buildStatus'), 'Seed dhoond rahe hain…');
+  if (!input) return setStatus($('#buildStatus'), 'Enter a seed channel (e.g. @EconomyPuzzle).', 'err');
+  setStatus($('#buildStatus'), 'Finding seed…');
   $('#progress').classList.remove('hidden');
   try {
     const r = await api('/api/maps', { method: 'POST', body: JSON.stringify({ input, depth: depthValue() }) });
@@ -91,11 +140,12 @@ $('#buildBtn').onclick = async () => {
     renderMap();
     loadMapList();
     prefillTrendingNiche();
-    setStatus($('#buildStatus'), 'Seed mil gaya — rings bhar rahe hain…', 'ok');
+    setStatus($('#buildStatus'), 'Seed found — building the rings…', 'ok');
+    loadStatus(); // refresh the token balance display
     await expandLoop();
     loadResults();
   } catch (e) {
-    setStatus($('#buildStatus'), e.message, 'err');
+    setStatus($('#buildStatus'), e.message + (e.status === 402 ? ' See the Pricing page to get more tokens.' : ''), 'err');
     $('#progress').classList.add('hidden');
   }
 };
@@ -147,7 +197,8 @@ async function expandLoop() {
     renderBreakouts(); renderTopics(); loadMapList(); loadResults();
   } catch (e) {
     if (currentMapId !== myMapId) return;
-    setStatus($('#buildStatus'), 'Build ruk gaya: ' + e.message + ' — Continue building dabao.', 'err');
+    if (e.status === 401) { setStatus($('#buildStatus'), 'Please log in to build maps.', 'err'); openAuthModal(); }
+    else setStatus($('#buildStatus'), 'Build stopped: ' + e.message + ytErrText(e) + (e.status === 402 ? ' See the Pricing page to get more tokens.' : ' — press Continue building to retry.'), 'err');
     $('#continueBtn').classList.remove('hidden');
     $('#mapBadge').classList.add('hidden');
   } finally {
@@ -161,16 +212,17 @@ function showStall(map) {
   const box = $('#stallNotice');
   const s = map.stall;
   if (!s) { box.classList.add('hidden'); return; }
-  box.innerHTML = `<b>⚠️ Is ring mein 0 neighbours mile.</b>
+  box.innerHTML = `<b>0 neighbours found in this ring.</b>
     <p>Niche keywords: <b>${(s.keywords || []).join(', ') || '—'}</b></p>
-    <p>Candidates mile: ${s.candidatesFound} · niche test pass: ${s.vettedPassed} · searches OK: ${s.searchesOk} · failed: ${s.searchesFailed} · quota used: ${fmt(s.quotaUsed)}</p>
-    <p class="muted">Wajah aksar: niche keywords bahut generic hain, ya YouTube searches fail ho gayi (quota). Dobara try karo — ya koi aur seed channel try karo.</p>
+    <p>Candidates found: ${s.candidatesFound} · niche test passed: ${s.vettedPassed} · searches OK: ${s.searchesOk} · cached: ${s.searchesCached || 0} · failed: ${s.searchesFailed} · quota used: ${fmt(s.quotaUsed)}</p>
+    ${s.yt ? `<p class="status err" style="margin:8px 0">YouTube: ${s.yt.status || ''} ${s.yt.reason || ''} — ${s.yt.message || ''}</p>` : ''}
+    <p class="muted">Common causes: the niche keywords are too generic, or YouTube searches failed (quota). Try again — or try a different seed channel.</p>
     <div class="row"><button class="btn primary" id="stallRetryBtn">Try again</button><button class="btn" id="stallDismissBtn">Dismiss</button></div>`;
   box.classList.remove('hidden');
   $('#stallRetryBtn').onclick = async () => {
     box.classList.add('hidden');
     if (!currentMapId) return;
-    setStatus($('#buildStatus'), 'Ring dobara try ho rahi hai…');
+    setStatus($('#buildStatus'), 'Retrying the ring…');
     await expandLoop();
   };
   $('#stallDismissBtn').onclick = () => box.classList.add('hidden');
@@ -184,7 +236,7 @@ async function loadMapList() {
     const r = await api('/api/maps');
     mapsList = (r.maps || []).slice().sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0));
     if (!mapsList.length) {
-      wrap.innerHTML = '<p class="muted">Abhi koi map nahi bana — upar seed channel likho aur Build map dabao.</p>';
+      wrap.innerHTML = '<p class="muted">No map yet — enter a seed channel above and press Build map.</p>';
       $('#clearMapsBtn').classList.add('hidden');
       return;
     }
@@ -200,7 +252,7 @@ async function loadMapList() {
     wrap.querySelectorAll('[data-open]').forEach(b => b.onclick = () => loadMap(b.dataset.open));
     wrap.querySelectorAll('[data-del]').forEach(b => b.onclick = async () => {
       const delId = b.dataset.del;
-      if (!confirm('Ye map delete kar dun?')) return;
+      if (!confirm('Delete this map?')) return;
       await api('/api/maps/' + delId, { method: 'DELETE' });
       const wasCurrent = delId === currentMapId;
       if (wasCurrent) { currentMapId = null; currentMap = null; }
@@ -213,7 +265,7 @@ async function loadMapList() {
   } catch (e) { wrap.innerHTML = `<p class="status err">${e.message}</p>`; }
 }
 $('#clearMapsBtn').onclick = async () => {
-  if (!mapsList.length || !confirm(`Saare ${mapsList.length} maps delete kar dun?`)) return;
+  if (!mapsList.length || !confirm(`Delete all ${mapsList.length} maps?`)) return;
   await api('/api/maps', { method: 'DELETE' });
   currentMapId = null; currentMap = null;
   await loadMapList(); loadResults();
@@ -230,12 +282,12 @@ async function loadMap(id) {
     prefillTrendingNiche();
     const p = $('#progress');
     if (currentMap.status === 'building') {
-      setStatus($('#buildStatus'), 'Map adhoora hai — Continue building se resume karo.', 'ok');
+      setStatus($('#buildStatus'), 'This map is incomplete — resume with Continue building.', 'ok');
       $('#continueBtn').classList.remove('hidden');
       p.classList.remove('hidden');
       $('#progressText').textContent = `Depth ${currentMap.builtDepth} of ${currentMap.depth} ready — ${currentMap.channels.length} channels`;
     } else if (currentMap.status === 'stalled') {
-      setStatus($('#buildStatus'), 'Ye map stall ho gaya tha — Try again se dobara try karo.', 'err');
+      setStatus($('#buildStatus'), 'This map stalled earlier — press Try again to retry.', 'err');
       showStall(currentMap);
       $('#continueBtn').classList.remove('hidden');
     } else {
@@ -307,8 +359,8 @@ function showHover(e, channelId) {
   if (!c) return;
   const card = $('#hoverCard');
   const best = c.videos.length ? Math.max(...c.videos.map(v => v.multiple || 0)) : 0;
-  card.innerHTML = `<img src="${thumbUrl(c.thumbnail)}" onerror="imgFallback(this,'${escAttr(c.title)}')" alt=""><h4>${c.title}</h4>` +
-    `<p>${fmt(c.subs)} subscribers</p><p>Median views: ${fmt(c.medianViews)}</p>` +
+  card.innerHTML = `<img src="${thumbUrl(c.thumbnail)}" onerror="imgFallback(this,'${escAttr(c.title)}')" alt=""><h4>${linkOrText(ytChannel(c.id, c.customUrl), c.title)}</h4>` +
+    `<p>${fmtSubs(c.subs)} subscribers</p><p>Median views: ${fmt(c.medianViews)}</p>` +
     `<p>Biggest breakout: <span class="mult">${best.toFixed(1)}×</span></p><p>${fmt(c.videoCount)} videos</p>`;
   const wrap = document.querySelector('.map-wrap').getBoundingClientRect();
   let x = e.clientX - wrap.left + 14, y = e.clientY - wrap.top + 14;
@@ -331,13 +383,13 @@ async function showChannelDetail(channelId) {
     // Full loaded-videos list (views desc): every video with outlier
     // multiple, published date and views — from map nodes AND Breakouts.
     const vids = (b.videos && b.videos.length ? b.videos : b.topVideos);
-    const top = vids.map(v => `<div class="bitem"><img class="thumb" src="${thumbUrl(v.thumbnail)}" onerror="thumbFallback(this)"><div class="grow"><div class="t">${v.title}</div><div class="m">${fmt(v.views)} views · ${v.multipleVsMedian}× median · ${ago(v.publishedAt)} · ${v.duration}</div></div><span class="badge-amber">${v.multipleVsMedian}×</span><button class="btn small" onclick="replicateVideo('${v.id}','${v.title.replace(/'/g, '')}')">Replicate script</button></div>`).join('');
+    const top = vids.map(v => `<div class="bitem"><img class="thumb" src="${thumbUrl(v.thumbnail)}" onerror="thumbFallback(this)"><div class="grow"><div class="t">${linkOrText(ytWatch(v.id), v.title)}</div><div class="m">${fmt(v.views)} views · ${v.multipleVsMedian}× median · ${ago(v.publishedAt)} · ${v.duration}</div></div><span class="badge-amber">${v.multipleVsMedian}×</span><button class="btn small" onclick="replicateVideo('${v.id}','${v.title.replace(/'/g, '')}')">Replicate script</button></div>`).join('');
     panel.innerHTML = `
       <div class="row"><img src="${thumbUrl(ch.thumbnail)}" onerror="imgFallback(this,'${escAttr(ch.title)}')" style="width:56px;height:56px;border-radius:50%">
-      <div><h3 style="margin:0">${ch.title}</h3><p class="muted" style="margin:2px 0">${ch.customUrl || ''} · ${ch.country || ''} · since ${ch.publishedAt ? ch.publishedAt.slice(0, 10) : ''}</p></div>
-      <a class="btn primary" style="margin-left:auto;text-decoration:none" href="/api/maps/${currentMapId}/channels/${channelId}/json" download>⬇ Download JSON</a></div>
+      <div><h3 style="margin:0">${linkOrText(ytChannel(ch.id, ch.customUrl), ch.title)}</h3><p class="muted" style="margin:2px 0">${ch.customUrl || ''} · ${ch.country || ''} · since ${ch.publishedAt ? ch.publishedAt.slice(0, 10) : ''}</p></div>
+      <a class="btn primary" style="margin-left:auto;text-decoration:none" href="/api/maps/${currentMapId}/channels/${channelId}/json" download>Download JSON</a></div>
       <div class="detail-grid">
-        <div class="stat"><b>${fmt(ch.subs)}</b><span>Subscribers</span></div>
+        <div class="stat"><b>${fmtSubs(ch.subs)}</b><span>Subscribers</span></div>
         <div class="stat"><b>${fmt(ch.totalViews)}</b><span>Total views</span></div>
         <div class="stat"><b>${fmt(ch.medianViews)}</b><span>Median views</span></div>
         <div class="stat"><b>${fmt(ch.viewsPerDay)}</b><span>Views / day</span></div>
@@ -348,13 +400,13 @@ async function showChannelDetail(channelId) {
       <p class="muted">Format: ${b.core_engine.format} · Hook: ${b.core_engine.hookStyle} · Pacing: ${b.core_engine.pacing}<br>
       Retention: ${b.core_engine.retentionDevices.join(', ')}<br>${b.core_engine.packagingNotes}</p>
       <h4>Top videos</h4>${top || '<p class="muted">No videos loaded for this channel.</p>'}
-      <p class="muted" style="font-size:12px">Videos list: ${vids.length} loaded video(s), views ke hisaab se sorted. ${b.note}</p>`;
+      <p class="muted" style="font-size:12px">Videos list: ${vids.length} loaded video(s), sorted by views. ${b.note}</p>`;
   } catch (e) { panel.innerHTML = `<p class="status err">${e.message}</p>`; }
 }
 
 // ---------- breakouts ----------
 async function renderBreakouts() {
-  if (!currentMapId) { $('#breakoutList').innerHTML = '<p class="muted">Pehle map banao — phir yahan breakout videos dikhengi.</p>'; return; }
+  if (!currentMapId) { $('#breakoutList').innerHTML = '<p class="muted">Build a map first — breakout videos will appear here.</p>'; return; }
   const min = $('#minBreakout').value;
   try {
     const r = await api(`/api/maps/${currentMapId}/breakouts?min=${min}`);
@@ -363,32 +415,32 @@ async function renderBreakouts() {
       <div class="bitem">
         <img class="thumb" src="${thumbUrl(b.thumbnail)}" onerror="thumbFallback(this)">
         <img class="dp" src="${thumbUrl(b.channelThumbnail)}" onerror="imgFallback(this,'${escAttr(b.channelTitle)}')">
-        <div class="grow"><div class="t">${b.title}</div><div class="m">${b.channelTitle} · ${fmt(b.views)} views · channel median ${fmt(b.channelMedian)} · ${ago(b.publishedAt)} · ${b.duration}</div></div>
+        <div class="grow"><div class="t">${linkOrText(ytWatch(b.videoId), b.title)}</div><div class="m">${linkOrText(ytChannel(b.channelId), b.channelTitle)} · ${fmt(b.views)} views · channel median ${fmt(b.channelMedian)} · ${ago(b.publishedAt)} · ${b.duration}</div></div>
         <span class="badge-amber">${b.multiple}×</span>
         <button class="btn small" onclick="showChannelDetail('${b.channelId}')">Open</button>
         <button class="btn small" onclick="replicateVideo('${b.videoId}','')">Replicate script</button>
-      </div>`).join('') : '<p class="muted">Is threshold par koi breakout nahi — minimum kam karke dekho.</p>';
-  } catch (e) { $('#breakoutList').innerHTML = `<p class="status err">${e.message}</p>`; }
+      </div>`).join('') : '<p class="muted">No breakouts at this threshold — try a lower minimum.</p>';
+  } catch (e) { $('#breakoutList').innerHTML = `<p class="status err">${e.message}${ytErrText(e)}</p>`; }
 }
 $('#minBreakout').onchange = renderBreakouts;
 
 // ---------- topics ----------
 async function renderTopics() {
-  if (!currentMapId) { $('#topicList').innerHTML = '<p class="muted">Pehle map banao — topics tumhare map ke breakout data se banenge.</p>'; return; }
+  if (!currentMapId) { $('#topicList').innerHTML = '<p class="muted">Build a map first — topics come from your map’s breakout data.</p>'; return; }
   try {
     const r = await api(`/api/maps/${currentMapId}/topics`);
     $('#topicList').innerHTML = r.topics.length ? r.topics.map(t => `
       <div class="topic"><h3>${t.topic} <span class="score">${t.score}/10</span></h3>
       <p>Expected: <b>${t.expectedViewsMonthly}</b> views/month</p><p>${t.why}</p>
       <ul>${t.titles.map(x => `<li>${x}</li>`).join('')}</ul></div>`).join('')
-      : '<p class="muted">Abhi topics ke liye kaafi breakout data nahi — map ko depth 2 tak bharo.</p>';
+      : '<p class="muted">Not enough breakout data for topics yet — build the map to depth 2.</p>';
   } catch (e) { $('#topicList').innerHTML = `<p class="status err">${e.message}</p>`; }
 }
 
 // ---------- map chat ----------
 $('#chatBtn').onclick = async () => {
   const q = $('#chatInput').value.trim();
-  if (!q || !currentMapId) { $('#chatAnswer').classList.remove('hidden'); $('#chatAnswer').innerHTML = '<p>Pehle map banao, phir sawal poocho.</p>'; return; }
+  if (!q || !currentMapId) { $('#chatAnswer').classList.remove('hidden'); $('#chatAnswer').innerHTML = '<p>Build a map first, then ask a question.</p>'; return; }
   const box = $('#chatAnswer');
   box.classList.remove('hidden');
   box.innerHTML = '<p>Searching your map…</p>';
@@ -396,8 +448,8 @@ $('#chatBtn').onclick = async () => {
     const r = await api(`/api/maps/${currentMapId}/chat`, { method: 'POST', body: JSON.stringify({ question: q }) });
     if (r.analysis && r.html) { box.innerHTML = r.html; return; }
     box.innerHTML = `<p>${r.answer}</p>` +
-      (r.channels.map(c => `<div class="bitem"><img class="dp" src="${thumbUrl(c.thumbnail)}" onerror="imgFallback(this,'${escAttr(c.title)}')"><div class="grow"><div class="t">${c.title}</div><div class="m">${fmt(c.subs)} subs · median ${fmt(c.medianViews)} views · best breakout ${c.bestMultiple.toFixed(1)}×</div></div><button class="btn small" onclick="showChannelDetail('${c.id}')">Open</button></div>`).join('')) +
-      (r.videos.map(v => `<div class="bitem"><img class="thumb" src="${thumbUrl(v.thumbnail)}" onerror="thumbFallback(this)"><div class="grow"><div class="t">${v.title}</div><div class="m">${v.channelTitle} · ${fmt(v.views)} views · ${v.multiple}×</div></div><button class="btn small" onclick="replicateVideo('${v.id}','')">Replicate script</button></div>`).join(''));
+      (r.channels.map(c => `<div class="bitem"><img class="dp" src="${thumbUrl(c.thumbnail)}" onerror="imgFallback(this,'${escAttr(c.title)}')"><div class="grow"><div class="t">${linkOrText(ytChannel(c.id), c.title)}</div><div class="m">${fmtSubs(c.subs)} subs · median ${fmt(c.medianViews)} views · best breakout ${c.bestMultiple.toFixed(1)}×</div></div><button class="btn small" onclick="showChannelDetail('${c.id}')">Open</button></div>`).join('')) +
+      (r.videos.map(v => `<div class="bitem"><img class="thumb" src="${thumbUrl(v.thumbnail)}" onerror="thumbFallback(this)"><div class="grow"><div class="t">${linkOrText(ytWatch(v.id), v.title)}</div><div class="m">${v.channelTitle} · ${fmt(v.views)} views · ${v.multiple}×</div></div><button class="btn small" onclick="replicateVideo('${v.id}','')">Replicate script</button></div>`).join(''));
   } catch (e) { box.innerHTML = `<p class="status err">${e.message}</p>`; }
 };
 
@@ -406,7 +458,7 @@ $('#chatSuggestChip').onclick = () => {
   if (!currentMapId) {
     const box = $('#chatAnswer');
     box.classList.remove('hidden');
-    box.innerHTML = '<p>Pehle map banao, phir analysis poocho.</p>';
+    box.innerHTML = '<p>Build a map first, then ask for an analysis.</p>';
     return;
   }
   $('#chatInput').value = 'Analyze my channel and suggest my next video topic — suggest videos from small and new channels with top outliers';
@@ -420,7 +472,7 @@ async function replicateVideo(videoId, title) {
   const modal = $('#scriptModal');
   modal.classList.remove('hidden');
   $('#scriptTitle').textContent = 'Replicated script — ' + (title || videoId);
-  $('#scriptMeta').textContent = 'Original script ban raha hai (same structure, fresh wording)…';
+  $('#scriptMeta').textContent = 'Writing an original script (same structure, fresh wording)…';
   $('#scriptBody').textContent = 'Please wait…';
   try {
     const r = await api(`/api/maps/${currentMapId}/videos/${videoId}/replicate`, { method: 'POST', body: '{}' });
@@ -433,7 +485,7 @@ async function replicateVideo(videoId, title) {
 }
 $('#scriptClose').onclick = () => $('#scriptModal').classList.add('hidden');
 $('#scriptModal').onclick = e => { if (e.target.id === 'scriptModal') $('#scriptModal').classList.add('hidden'); };
-$('#scriptCopy').onclick = async () => { try { await navigator.clipboard.writeText(currentScript); $('#scriptCopy').textContent = 'Copied ✓'; setTimeout(() => $('#scriptCopy').textContent = 'Copy script', 1500); } catch (e) { alert('Copy nahi hua — text select karke copy karo.'); } };
+$('#scriptCopy').onclick = async () => { try { await navigator.clipboard.writeText(currentScript); $('#scriptCopy').textContent = 'Copied ✓'; setTimeout(() => $('#scriptCopy').textContent = 'Copy script', 1500); } catch (e) { alert('Copy failed — please select the text and copy it manually.'); } };
 $('#scriptDownload').onclick = () => {
   const blob = new Blob([currentScript], { type: 'text/markdown' });
   const a = document.createElement('a');
@@ -451,7 +503,7 @@ async function loadTrending(refresh) {
   // get the server's "API key" error shown below.
   const box = $('#trendingList');
   const niche = $('#trendingNiche').value.trim();
-  box.innerHTML = '<p>Trending channels dhoond rahe hain… (pehli dafa ~1–2 minute lag sakte hain)</p>';
+  box.innerHTML = '<p>Finding trending channels… (the first run can take 1–2 minutes)</p>';
   try {
     const q = new URLSearchParams();
     if (niche) q.set('niche', niche);
@@ -459,16 +511,20 @@ async function loadTrending(refresh) {
     if (refresh) q.set('refresh', '1');
     const r = await api('/api/trending?' + q.toString());
     trendingData = r; trendingPage = 0;
-    $('#trendingAsOf').textContent = `Data as of: ${new Date(r.asOf).toLocaleString()}${r.cached ? ' (cached — aaj ka data)' : ''} · Is run par quota: ${fmt(r.quotaUsed)} units · Niche: ${r.niche}`;
+    if (!r.cached) loadStatus(); // a fresh run spent tokens — refresh the balance
+    $('#trendingAsOf').textContent = `Data as of: ${new Date(r.asOf).toLocaleString()}${r.cached ? ' (cached — today’s data)' : ''} · Quota used by this run: ${fmt(r.quotaUsed)} units · Niche: ${r.niche}`;
     $('#trendingNote').textContent = r.note;
     renderTrendingPage();
-  } catch (e) { box.innerHTML = `<p class="status err">${e.message}</p>`; }
+  } catch (e) {
+    if (e.status === 401) openAuthModal();
+    box.innerHTML = `<p class="status err">${e.message}${ytErrText(e)}${e.status === 402 ? ' See the Pricing page to get more tokens.' : ''}</p>`;
+  }
 }
 function renderTrendingPage() {
   const box = $('#trendingList');
   const list = (trendingData && trendingData.channels) || [];
   if (!list.length) {
-    box.innerHTML = '<p class="muted">Pichle 24h mein is niche mein koi naya qualifying channel nahi mila. (Criteria: channel 30–60 din purana, 1000+ subs, aur 24h video ke views 100,000+.)</p>';
+    box.innerHTML = '<p class="muted">No new qualifying channel in this niche in the last 24h. (Criteria: channel 30–60 days old, 1,000+ subscribers, and 100,000+ views on its 24h video.)</p>';
     $('#trendingPager').classList.add('hidden');
     return;
   }
@@ -479,9 +535,9 @@ function renderTrendingPage() {
   box.innerHTML = slice.map(c => `
     <div class="bitem">
       <img class="dp" src="${thumbUrl(c.thumbnail)}" onerror="imgFallback(this,'${escAttr(c.title)}')">
-      <div class="grow"><div class="t">${c.title}</div>
-      <div class="m">${fmt(c.subs)} subs · ${c.ageDays} days old · channel median ${fmt(c.medianViews)} views</div>
-      ${c.videos.map(v => `<div class="t" style="font-weight:400;font-size:14px">${v.title}</div><div class="m">${fmt(v.views)} views · ${v.multiple == null ? 'outlier n/a (median &lt; 100)' : v.multiple + '×'} · ${ago(v.publishedAt)} · ${v.duration}</div>`).join('')}
+      <div class="grow"><div class="t">${linkOrText(ytChannel(c.channelId), c.title)}</div>
+      <div class="m">${fmtSubs(c.subs)} subs · ${c.ageDays} days old · channel median ${fmt(c.medianViews)} views</div>
+      ${c.videos.map(v => `<div class="t" style="font-weight:400;font-size:14px">${linkOrText(ytWatch(v.id), v.title)}</div><div class="m">${fmt(v.views)} views · ${v.multiple == null ? 'outlier n/a (median &lt; 100)' : v.multiple + '×'} · ${ago(v.publishedAt)} · ${v.duration}</div>`).join('')}
       </div>
       ${c.bestMultiple == null ? '<span class="badge-amber">n/a</span>' : `<span class="badge-amber">${c.bestMultiple}×</span>`}
     </div>`).join('');

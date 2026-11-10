@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ChannelScope — Admin</title>
+<link rel="stylesheet" href="/admin.css">
+</head>
+<body>
+<main class="admin-wrap">
+  <header class="admin-head">
+    <div class="brand"><span class="logo">◎</span> ChannelScope <span class="muted">/ Admin</span></div>
+    <a class="back" href="/">← Back to site</a>
+  </header>
+
+  <div id="authCard" class="card">
+    <h2 id="authTitle">Admin login</h2>
+    <p class="muted" id="authSub">This panel is for the site owner only.</p>
+    <div id="setupBox" class="hidden">
+      <p class="muted">No admin account exists yet. Create the first admin account — it will own this panel.</p>
+    </div>
+    <label>Email</label>
+    <input type="email" id="adminEmail" placeholder="you@example.com">
+    <label>Password</label>
+    <input type="password" id="adminPass" placeholder="password (8+ characters)">
+    <div id="authMsg"></div>
+    <div class="row">
+      <button class="btn primary" id="authSubmit" style="flex:1">Login</button>
+      <button class="btn hidden" id="logoutBtn">Logout</button>
+    </div>
+  </div>
+
+  <div id="panel" class="hidden">
+    <p class="muted" id="adminWho"></p>
+
+    <section class="card">
+      <h2>YouTube API key</h2>
+      <p class="muted">One key runs the whole site — every visitor shares it. The key is stored on the server only and is never shown to anyone.</p>
+      <p id="keyState" class="key-state">Checking…</p>
+      <div class="row">
+        <input type="password" id="keyInput" placeholder="AIzaSy…" autocomplete="off" style="flex:1;min-width:220px">
+        <button class="btn primary" id="saveKeyBtn">Save key</button>
+        <button class="btn danger" id="removeKeyBtn">Remove key</button>
+      </div>
+      <p class="muted small">How to create a key: Google Cloud Console → YouTube Data API v3 → Enable → Credentials → Create API key → restrict it to YouTube Data API v3 only.</p>
+      <div id="keyMsg"></div>
+    </section>
+
+    <section class="card">
+      <h2>Tokens &amp; plans</h2>
+      <p class="muted">Every logged-in user gets 100 free tokens per day (refreshes daily, never accumulates). Paid plans: Starter $2/mo = 1,500 tokens/mo, Pro $5/mo = 5,000 tokens/mo. Costs: map Depth 1 = 50, Depth 2 = 100, Depth 4 = 200 tokens; Trending run = 50. Cached views cost 0.</p>
+      <div id="userTable" style="margin:10px 0"></div>
+      <div class="grid2">
+        <label>Grant paid tokens<input type="email" id="grantEmail" placeholder="user email"></label>
+        <label>Amount<input type="number" id="grantAmount" min="1" step="1" placeholder="tokens"></label>
+      </div>
+      <div class="row" style="margin-top:10px">
+        <button class="btn primary" id="grantBtn">Grant tokens</button>
+        <span id="grantMsg" class="muted"></span>
+      </div>
+      <div class="grid2" style="margin-top:16px">
+        <label>Set plan<input type="email" id="planEmail" placeholder="user email"></label>
+        <label>Plan
+          <select id="planSelect">
+            <option value="free">Free</option>
+            <option value="starter">Starter ($2/mo)</option>
+            <option value="pro">Pro ($5/mo)</option>
+          </select>
+        </label>
+      </div>
+      <div class="row" style="margin-top:10px">
+        <button class="btn primary" id="setPlanBtn">Set plan</button>
+        <span id="planMsg" class="muted"></span>
+      </div>
+      <p class="muted small" style="margin-top:14px">Stripe setup: set STRIPE_SECRET_KEY, STRIPE_PUBLISHABLE_KEY, STRIPE_WEBHOOK_SECRET, STRIPE_PRICE_1500 and STRIPE_PRICE_5000 as env vars (Render dashboard → Environment). Create two recurring monthly prices in the Stripe dashboard (Starter $2, Pro $5) and paste their price IDs. Webhook endpoint: https://&lt;your-domain&gt;/api/billing/webhook — listen for checkout.session.completed, invoice.paid, customer.subscription.deleted and customer.subscription.updated. Until the keys are set, the Pricing page shows “Payments coming soon”.</p>
+    </section>
+
+    <section class="card">
+      <h2>Allowed emails</h2>
+      <p class="muted">Only these emails see unblurred Overview / Trending data. Building maps needs login + tokens — the allowlist does not gate it.</p>
+      <div class="row">
+        <input type="email" id="allowEmail" placeholder="email to allow" style="flex:1;min-width:200px">
+        <button class="btn primary" id="allowAddBtn">Add</button>
+      </div>
+      <div id="allowList" style="margin-top:10px"></div>
+      <div id="allowMsg"></div>
+    </section>
+
+    <section class="card">
+      <h2>Quota</h2>
+      <p class="muted" id="quotaLine">—</p>
+      <p class="muted small">Shared by all users. One Depth-2 map costs about 2,300 units; a trending run about 335 units. Default daily quota is 10,000 units.</p>
+    </section>
+  </div>
+</main>
+<script src="/admin.js"></script>
+</body>
+</html>

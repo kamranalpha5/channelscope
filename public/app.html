@@ -10,15 +10,21 @@
 <header class="topbar">
   <div class="logo"><span class="radar-dot"></span> ChannelScope</div>
   <nav class="pillnav">
-    <a href="/">Overview</a>
-    <a href="#topics">Topics</a>
-    <a href="#map">Map</a>
-    <a href="#breakouts">Breakouts</a>
-    <a href="#mapchat">Map chat</a>
-    <a href="#trending">Trending 24h</a>
-    <a href="#results">Results</a>
+    <a href="/"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="9" rx="1.5"/><rect x="14" y="3" width="7" height="5" rx="1.5"/><rect x="14" y="12" width="7" height="9" rx="1.5"/><rect x="3" y="16" width="7" height="5" rx="1.5"/></svg>Overview</a>
+    <a href="#topics"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18h6M10 21h4"/><path d="M12 3a6 6 0 0 0-4 10.5c.8.7 1 1.5 1 2.5h6c0-1 .2-1.8 1-2.5A6 6 0 0 0 12 3z"/></svg>Topics</a>
+    <a href="#map"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="4.5"/><circle cx="12" cy="12" r="1" fill="currentColor"/></svg>Map</a>
+    <a href="#breakouts"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 17l6-6 4 4 8-8"/><path d="M15 7h6v6"/></svg>Breakouts</a>
+    <a href="#mapchat"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 11.5a8.5 8.5 0 0 1-12.4 7.5L3 21l2-5.6A8.5 8.5 0 1 1 21 11.5z"/></svg>Map chat</a>
+    <a href="#trending"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2L4.5 13.5H11L9.5 22 19 10h-6.5L13 2z"/></svg>Trending 24h</a>
+    <a href="#results"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v18h18"/><path d="M7 15v3M12 10v8M17 6v12"/></svg>Results</a>
+    <a href="/pricing.html"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v10M15 9.5c0-1.4-1.3-2.5-3-2.5s-3 1.1-3 2.5 1 2 3 2.5 3 1.1 3 2.5-1.3 2.5-3 2.5-3-1.1-3-2.5"/></svg>Pricing</a>
   </nav>
-  <button class="btn small" id="keyBtn">🔑 API Key</button>
+  <div class="row" style="justify-self:end">
+    <span class="tokenchip hidden" id="tokenChip"></span>
+    <span class="userchip" id="userChip">Guest</span>
+    <button class="btn small" id="loginBtn">Login</button>
+    <button class="btn small hidden" id="logoutBtn">Logout</button>
+  </div>
 </header>
 
 <main>
@@ -31,7 +37,7 @@
     <div class="builder card" id="builder">
       <label>Seed channel</label>
       <div class="row">
-        <input id="seedInput" type="text" placeholder="@EconomyPuzzle  ya  youtube.com/@handle  ya  channel ID" autocomplete="off">
+        <input id="seedInput" type="text" placeholder="@EconomyPuzzle  or  youtube.com/@handle  or  channel ID" autocomplete="off">
         <button class="btn primary" id="buildBtn">Build map</button>
       </div>
       <div class="row depth-row">
@@ -42,22 +48,9 @@
       <p class="hint">Depth 1 ≈ 16 channels · Depth 2 ≈ 70 · Depth 4 ≈ 273. Niche is derived from YOUR seed channel — never hardcoded.</p>
       <div id="buildStatus" class="status"></div>
       <div id="progress" class="progress hidden"><div class="bar" id="progressBar"></div><span id="progressText"></span></div>
-      <div id="keyWarn" class="warn hidden">⚠️ API key saved nahi hai — pehle <button class="linklike" id="keyWarnBtn">Settings mein key daalo</button>.</div>
     </div>
 
-    <div class="quotabar card" id="quotaBar">Quota: <b id="quotaUsed">–</b> / 10,000 units today · Search = 100 units · most other calls = 1</div>
-  </section>
-
-  <!-- API KEY SETUP -->
-  <section class="card section" id="keySection">
-    <h2>API key setup</h2>
-    <p>Apni <b>YouTube Data API v3 key</b> yahan paste karo. Key sirf is PC par save hoti hai (data/settings.json) — kahin aur nahi bheji jati. Key banane ke liye: Google Cloud Console → YouTube Data API v3 Enable → Credentials → Create API key → sirf YouTube Data API v3 par restrict karo.</p>
-    <div class="row">
-      <input id="apiKeyInput" type="password" placeholder="AIzaSy... (apni key yahan paste karo)" autocomplete="off">
-      <button class="btn primary" id="saveKeyBtn">Save key</button>
-      <button class="btn danger hidden" id="removeKeyBtn">Remove key</button>
-    </div>
-    <div id="keyStatus" class="status"></div>
+    <div class="quotabar card" id="quotaBar">Quota: <b id="quotaUsed">–</b> / 10,000 units today · Search = 100 units · most other calls = 1 <span id="quotaLimits" class="muted"></span></div>
   </section>
 
   <!-- MAP -->
@@ -70,7 +63,7 @@
     </div>
     <div id="stallNotice" class="card stallbox hidden"></div>
     <div class="card map-wrap">
-      <div id="mapEmpty" class="empty">Abhi koi map nahi hai.<br>Upar seed channel likho aur <b>Build map</b> dabao — seed ~1 second mein dikhega, phir rings bharte jayenge.</div>
+      <div id="mapEmpty" class="empty">No map yet.<br>Enter a seed channel above and press <b>Build map</b> — the seed appears in about a second, then the rings fill in.</div>
       <svg id="mapSvg" viewBox="0 0 900 600" class="hidden" role="img" aria-label="Channel map"></svg>
       <div id="hoverCard" class="hover-card hidden"></div>
     </div>
@@ -81,7 +74,7 @@
   <!-- BREAKOUTS -->
   <section class="section" id="breakouts">
     <h2>Breakouts</h2>
-    <p class="sub2">Every video punching above its own channel's median.</p>
+    <p class="sub2">Every video punching above its own channel's median. Click a video to open it on YouTube.</p>
     <div class="row">
       <label>Minimum breakout</label>
       <select id="minBreakout"><option value="2">2×</option><option value="3" selected>3×</option><option value="5">5×</option><option value="10">10×</option><option value="20">20×</option></select>
@@ -106,7 +99,7 @@
       <button class="btn primary" id="chatBtn">Ask</button>
     </div>
     <div class="row" style="margin-top:8px">
-      <button class="btn small" id="chatSuggestChip">💡 Analyze my channel and suggest my next video topic</button>
+      <button class="btn small" id="chatSuggestChip"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18h6M10 21h4"/><path d="M12 3a6 6 0 0 0-4 10.5c.8.7 1 1.5 1 2.5h6c0-1 .2-1.8 1-2.5A6 6 0 0 0 12 3z"/></svg>Analyze my channel and suggest my next video topic</button>
     </div>
     <div id="chatAnswer" class="card hidden"></div>
   </section>
@@ -114,12 +107,12 @@
   <!-- TRENDING 24h -->
   <section class="section" id="trending">
     <h2>Trending 24h</h2>
-    <p class="sub2">Pichle 24 hours mein trending NEW channels — 30–60 din purane, monetization criteria signal complete.</p>
-    <p class="warn" id="trendingNote" style="margin-top:0">Criteria signal: 1000+ subs aur views lakhs mein (100,000+) — watch hours API se verify nahi ho sakte, is liye yehi signal use hota hai.</p>
+    <p class="sub2">New channels trending in the last 24 hours — 30–60 days old, with the monetization criteria signal complete.</p>
+    <p class="warn" id="trendingNote" style="margin-top:0">Criteria signal: 1,000+ subscribers and 100,000+ views on the trending video — watch hours cannot be verified via the YouTube Data API, so this is the signal used.</p>
     <div class="row">
-      <input id="trendingNiche" type="text" placeholder="Niche (khaali chhoro to current map ki niche)">
+      <input id="trendingNiche" type="text" placeholder="Niche (leave empty to use the current map's niche)">
       <button class="btn primary" id="trendingBtn">Load trending</button>
-      <button class="btn" id="trendingRefreshBtn">↻ Refresh</button>
+      <button class="btn" id="trendingRefreshBtn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.6-6.4"/><path d="M21 3v6h-6"/></svg>Refresh</button>
     </div>
     <p class="muted" id="trendingAsOf" style="margin-top:8px"></p>
     <div id="trendingList" class="list"></div>
@@ -136,8 +129,28 @@
     <div id="resultsGrid" class="results-grid"></div>
   </section>
 
-  <footer>ChannelScope (standalone) · Your key stays on your PC · YouTube data via YouTube Data API v3 · Not affiliated with YouTube or Google.</footer>
+  <footer>ChannelScope · YouTube data via YouTube Data API v3 · Not affiliated with YouTube or Google. · <a href="/privacy">Privacy Policy</a></footer>
 </main>
+
+<!-- LOGIN MODAL -->
+<div id="authModal" class="modal hidden">
+  <div class="modal-box auth-box">
+    <div class="row space"><h3 id="authTitle" style="margin:0">Login</h3><button class="btn small" id="authCancel">✕</button></div>
+    <div class="tabs" style="margin:12px 0 6px">
+      <button class="tab active" id="tabLogin">Login</button>
+      <button class="tab" id="tabRegister">Register</button>
+    </div>
+    <label style="display:block;font-size:13px;color:var(--muted);margin:10px 0 4px">Email</label>
+    <input type="email" id="authEmail" placeholder="you@example.com" style="width:100%">
+    <label style="display:block;font-size:13px;color:var(--muted);margin:10px 0 4px">Password</label>
+    <input type="password" id="authPass" placeholder="password" style="width:100%">
+    <div id="authMsg"></div>
+    <div class="row" style="margin-top:16px">
+      <button class="btn primary" id="authSubmit" style="flex:1">Login</button>
+    </div>
+    <p class="muted" style="font-size:13px;margin-top:12px">Registering creates an account — full unblurred data is only available if the site owner grants your email access. · <a href="/privacy">Privacy Policy</a></p>
+  </div>
+</div>
 
 <!-- SCRIPT MODAL -->
 <div id="scriptModal" class="modal hidden">

@@ -135,3 +135,23 @@ select, input[type="email"], input[type="password"], input[type="text"] {
   .comp-cols, .comp-row { grid-template-columns: 1fr 56px 70px 44px; }
   .comp-cols .hide-m, .comp-row .hide-m { display: none; }
 }
+
+/* ---------- token chip + Pricing page (v1.3.1) ---------- */
+.tokenchip { display: inline-flex; align-items: center; gap: 6px; background: #12365e; border: 1px solid var(--line); border-radius: 999px; padding: 5px 12px; font-size: 13px; font-weight: 600; color: var(--amber); white-space: nowrap; }
+.tokenchip svg { width: 15px; height: 15px; flex: none; }
+.tokenchip a { color: var(--amber); }
+.status.info { background: #12365e; color: var(--text); }
+.pricing-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; margin-bottom: 16px; }
+.plan-card { position: relative; background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 22px; display: flex; flex-direction: column; gap: 10px; transition: transform .2s ease, border-color .2s ease, box-shadow .2s ease; }
+.plan-card:hover { transform: translateY(-3px); border-color: var(--blue); box-shadow: 0 10px 28px rgba(56,189,248,.14); }
+.plan-card.featured { border-color: var(--amber); }
+.plan-card.current { border-color: var(--green); }
+.plan-badge { position: absolute; top: -11px; right: 16px; background: var(--amber); color: #231303; font-size: 12px; font-weight: 700; padding: 3px 10px; border-radius: 999px; }
+.plan-name { font-size: 18px; font-weight: 700; }
+.plan-price { font-size: 34px; font-weight: 800; line-height: 1; }
+.plan-per { font-size: 14px; font-weight: 400; color: var(--muted); }
+.plan-tokens { color: var(--blue); font-weight: 600; font-size: 15px; }
+.plan-features { list-style: none; margin: 4px 0 8px; padding: 0; display: grid; gap: 8px; color: var(--text); font-size: 14px; line-height: 1.5; }
+.plan-features li::before { content: "\2713  "; color: var(--green); font-weight: 700; }
+.plan-card .btn { margin-top: auto; }
+@media (max-width: 900px) { .pricing-grid { grid-template-columns: 1fr; } }
