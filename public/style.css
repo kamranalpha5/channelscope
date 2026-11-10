@@ -7,10 +7,10 @@
 }
 *{box-sizing:border-box}
 html{scroll-behavior:smooth}
-body{margin:0;background:var(--navy);color:var(--text);font-family:Segoe UI,Arial,sans-serif;line-height:1.55}
+body{margin:0;background:var(--navy);color:var(--text);font-family:var(--font);line-height:1.55}
 a{color:var(--blue)}
-h1{font-size:42px;margin:8px 0}
-h2{font-size:26px;margin:0 0 10px}
+.hero h1{font-size:40px;margin:8px 0}
+h2{font-size:22px;margin:0 0 10px}
 .sub{color:var(--muted);font-size:18px;max-width:640px}
 .sub2{color:var(--muted);margin-top:-6px}
 .muted{color:var(--muted)}
@@ -143,7 +143,7 @@ pre{background:#0b1a33;border:1px solid var(--line);border-radius:10px;padding:1
 .modal-box{background:var(--navy2);border:1px solid var(--line);border-radius:14px;max-width:760px;width:100%;padding:18px;max-height:90vh;overflow:auto;animation:modalIn .22s ease}
 @keyframes modalIn{from{opacity:0;transform:translateY(12px) scale(.98)}to{opacity:1;transform:none}}
 footer{max-width:1060px;margin:40px auto 30px;padding:0 16px;color:var(--muted);font-size:13px;text-align:center}
-@media(max-width:640px){h1{font-size:30px}.pillnav{display:none}.bitem img.thumb{width:84px;height:48px}}
+@media(max-width:640px){.hero h1{font-size:30px}.pillnav{display:none}.bitem img.thumb{width:84px;height:48px}}
 /* Animations must never slow the work down — and respect reduced-motion. */
 @media (prefers-reduced-motion: reduce){
   *,*::before,*::after{animation-duration:.01ms!important;animation-iteration-count:1!important;transition-duration:.01ms!important}

@@ -1,0 +1,55 @@
+/* ChannelScope — shared design system (v1.3.2).
+   Single source of truth for colour tokens, type scale, spacing, focus
+   states, skeletons and motion. Every page links this FIRST, then its own
+   page stylesheet; page stylesheets keep only layout + page specifics. */
+:root{
+  /* colour tokens — deep navy + sky blue + amber, one set everywhere */
+  --navy:#0a1428; --navy2:#0f1e3a; --panel:#12233f; --panel2:#0b1a33;
+  --card:#12233f; --line:#1e3a5f;
+  --blue:#38bdf8; --blue2:#0ea5e9; --amber:#f59e0b; --amber2:#fbbf24;
+  --text:#e8f0fa; --muted:#93a7c4; --green:#22c55e; --red:#ef4444;
+  /* spacing scale — margins/paddings use one of these */
+  --s1:4px; --s2:8px; --s3:12px; --s4:16px; --s5:24px; --s6:32px;
+  --font:system-ui,-apple-system,"Segoe UI",Roboto,Arial,sans-serif;
+  --ease:cubic-bezier(.2,.7,.3,1);
+}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{margin:0;background:var(--navy);color:var(--text);font-family:var(--font);font-size:15px;line-height:1.55}
+a{color:var(--blue);text-decoration:none;transition:color .18s ease}
+a:hover{text-decoration:underline}
+button{font-family:inherit}
+/* type scale — page title 28, section 22, card title 18, body 15, small 13 */
+h1{font-size:28px;line-height:1.2;margin:0 0 var(--s2)}
+h2{font-size:22px;line-height:1.25;margin:0 0 var(--s3)}
+h3{font-size:18px;line-height:1.3;margin:0 0 var(--s2)}
+small,.small{font-size:13px}
+/* visible keyboard focus on every interactive element */
+:focus-visible{outline:2px solid var(--blue);outline-offset:2px;border-radius:4px}
+/* icons are inline SVG only — never emoji or text glyphs */
+.side-nav a svg,.pillnav a svg{width:18px;height:18px;flex:none;vertical-align:-4px;margin-right:7px}
+.btn svg{width:15px;height:15px;flex:none;vertical-align:-2px}
+.brand .logo svg{width:20px;height:20px}
+/* loading skeletons (used by Overview panels + viral cards) */
+.skel-row{display:flex;gap:10px;align-items:center;padding:9px 0}
+.skel{display:block;background:linear-gradient(90deg,#12365e 25%,#1d3f6b 50%,#12365e 75%);background-size:200% 100%;border-radius:6px;animation:skelShimmer 1.4s linear infinite}
+.skel-dp{width:36px;height:36px;border-radius:50%;flex:none}
+.skel-line{height:12px}
+.skel-thumb{display:block;width:100%;aspect-ratio:16/9;border-radius:0}
+.skel-card{background:var(--panel);border:1px solid var(--line);border-radius:12px;overflow:hidden;padding-bottom:12px}
+.skel-card .skel-line{margin:10px 12px 0}
+@keyframes skelShimmer{to{background-position:-200% 0}}
+/* responsive: narrow screens stack the topbar and shrink display type */
+@media (max-width:900px){
+  .topbar{flex-wrap:wrap}
+}
+@media (max-width:640px){
+  h1{font-size:24px}
+  .hero h1{font-size:30px}
+  .hero{padding:28px 16px 8px}
+}
+/* motion: smooth 150–250ms transitions; honour reduced-motion everywhere */
+@media (prefers-reduced-motion: reduce){
+  *,*::before,*::after{animation-duration:.01ms!important;animation-iteration-count:1!important;transition-duration:.01ms!important}
+  html{scroll-behavior:auto}
+}

@@ -4,6 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>ChannelScope — YouTube Competitor Map</title>
+<link rel="stylesheet" href="design.css">
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
@@ -129,13 +130,13 @@
     <div id="resultsGrid" class="results-grid"></div>
   </section>
 
-  <footer>ChannelScope · YouTube data via YouTube Data API v3 · Not affiliated with YouTube or Google. · <a href="/privacy">Privacy Policy</a></footer>
+  <footer>ChannelScope · YouTube data via YouTube Data API v3 · Not affiliated with YouTube or Google. · <a href="/privacy">Privacy Policy</a> · <a href="/terms">Terms of Service</a></footer>
 </main>
 
 <!-- LOGIN MODAL -->
 <div id="authModal" class="modal hidden">
   <div class="modal-box auth-box">
-    <div class="row space"><h3 id="authTitle" style="margin:0">Login</h3><button class="btn small" id="authCancel">✕</button></div>
+    <div class="row space"><h3 id="authTitle" style="margin:0">Login</h3><button class="btn small" id="authCancel" aria-label="Close"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6L6 18M6 6l12 12"/></svg></button></div>
     <div class="tabs" style="margin:12px 0 6px">
       <button class="tab active" id="tabLogin">Login</button>
       <button class="tab" id="tabRegister">Register</button>
@@ -148,14 +149,14 @@
     <div class="row" style="margin-top:16px">
       <button class="btn primary" id="authSubmit" style="flex:1">Login</button>
     </div>
-    <p class="muted" style="font-size:13px;margin-top:12px">Registering creates an account — full unblurred data is only available if the site owner grants your email access. · <a href="/privacy">Privacy Policy</a></p>
+    <p class="muted" style="font-size:13px;margin-top:12px">Registering creates an account — full unblurred data is only available if the site owner grants your email access. · <a href="/privacy">Privacy Policy</a> · <a href="/terms">Terms of Service</a></p>
   </div>
 </div>
 
 <!-- SCRIPT MODAL -->
 <div id="scriptModal" class="modal hidden">
   <div class="modal-box">
-    <div class="row space"><h3 id="scriptTitle">Replicated script</h3><button class="btn small" id="scriptClose">✕</button></div>
+    <div class="row space"><h3 id="scriptTitle">Replicated script</h3><button class="btn small" id="scriptClose" aria-label="Close"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6L6 18M6 6l12 12"/></svg></button></div>
     <p class="muted" id="scriptMeta"></p>
     <pre id="scriptBody"></pre>
     <div class="row"><button class="btn primary" id="scriptCopy">Copy script</button><button class="btn" id="scriptDownload">Download .md</button></div>

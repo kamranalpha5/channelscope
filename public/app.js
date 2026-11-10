@@ -103,9 +103,15 @@ async function loadStatus() {
     $('#logoutBtn').classList.toggle('hidden', !(me && me.loggedIn));
     const ql = $('#quotaLimits');
     if (ql) {
-      const searchInfo = ` · Search calls used today: ${fmt(s.searchUsed || 0)} / ${fmt(s.searchLimit || 100)}`;
+      // v1.3.2: when YouTube's daily search limit is exhausted, say so here —
+      // new builds are blocked before charging, cached builds still work.
+      const searchInfo = ` · Search calls used today: ${fmt(s.searchUsed || 0)} / ${fmt(s.searchLimit || 100)}` + (s.searchBlocked ? ' · YouTube search limit reached today — new searches resume tomorrow (cached builds still work)' : '');
       if (me && me.loggedIn && s.tokens) {
-        ql.innerHTML = ` · <a class="yt-link" href="/pricing.html">${fmt(s.tokens.balance)} tokens</a> · ${fmt(s.tokens.freeLeft)} free left today · ${s.tokens.planName} plan · ${fmt(s.quotaRemaining)} units remaining${searchInfo}`;
+        // Admins never pay tokens (v1.3.2) — the quota bar says so.
+        const tokenPart = s.tokens.unlimited
+          ? 'Admin · Unlimited'
+          : `<a class="yt-link" href="/pricing.html">${fmt(s.tokens.balance)} tokens</a> · ${fmt(s.tokens.freeLeft)} free left today · ${s.tokens.planName} plan`;
+        ql.innerHTML = ` · ${tokenPart} · ${fmt(s.quotaRemaining)} units remaining${searchInfo}`;
       } else {
         ql.textContent = ' · Log in to build maps.' + searchInfo;
       }
@@ -114,7 +120,9 @@ async function loadStatus() {
     if (tc) {
       if (me && me.loggedIn && s.tokens) {
         tc.classList.remove('hidden');
-        tc.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v10M15 9.5c0-1.4-1.3-2.5-3-2.5s-3 1.1-3 2.5 1 2 3 2.5 3 1.1 3 2.5-1.3 2.5-3 2.5-3-1.1-3-2.5"/></svg><a href="/pricing.html">${fmt(s.tokens.balance)} tokens · ${s.tokens.planName}</a>`;
+        // Admins never pay tokens (v1.3.2) — the chip says so.
+        const label = s.tokens.unlimited ? 'Admin · Unlimited' : `${fmt(s.tokens.balance)} tokens · ${s.tokens.planName}`;
+        tc.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v10M15 9.5c0-1.4-1.3-2.5-3-2.5s-3 1.1-3 2.5 1 2 3 2.5 3 1.1 3 2.5-1.3 2.5-3 2.5-3-1.1-3-2.5"/></svg><a href="/pricing.html">${label}</a>`;
       } else {
         tc.classList.add('hidden');
       }
@@ -247,7 +255,7 @@ async function loadMapList() {
         <div class="grow"><div class="t">${m.seedTitle}</div>
         <div class="m">Depth ${m.depth} · ${m.channelCount} channels · ${m.status}${m.stall ? ' · stalled' : ''} · ${ago(m.createdAt)}</div></div>
         <button class="btn small" data-open="${m.id}">Open</button>
-        <button class="btn small danger" data-del="${m.id}" title="Delete map">✕</button>
+        <button class="btn small danger" data-del="${m.id}" title="Delete map" aria-label="Delete map"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6L6 18M6 6l12 12"/></svg></button>
       </div>`).join('');
     wrap.querySelectorAll('[data-open]').forEach(b => b.onclick = () => loadMap(b.dataset.open));
     wrap.querySelectorAll('[data-del]').forEach(b => b.onclick = async () => {

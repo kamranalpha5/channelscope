@@ -29,9 +29,13 @@ async function loadMe() {
     billing = await api('/api/billing/me');
     const tc = $('#tokenChip');
     tc.classList.remove('hidden');
-    tc.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v10M15 9.5c0-1.4-1.3-2.5-3-2.5s-3 1.1-3 2.5 1 2 3 2.5 3 1.1 3 2.5-1.3 2.5-3 2.5-3-1.1-3-2.5"/></svg><a href="/pricing.html">${fmt(billing.balance)} tokens · ${billing.planName}</a>`;
+    // Admins never pay tokens (v1.3.2) — the chip says so.
+    const chipLabel = billing.unlimited ? 'Admin · Unlimited' : `${fmt(billing.balance)} tokens · ${billing.planName}`;
+    tc.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v10M15 9.5c0-1.4-1.3-2.5-3-2.5s-3 1.1-3 2.5 1 2 3 2.5 3 1.1 3 2.5-1.3 2.5-3 2.5-3-1.1-3-2.5"/></svg><a href="/pricing.html">${chipLabel}</a>`;
     const period = billing.periodEnd ? ` · renews ${new Date(billing.periodEnd).toLocaleDateString()}` : '';
-    $('#balanceLine').innerHTML = `<b>${fmt(billing.balance)} tokens</b> available — ${fmt(billing.freeLeft)} free left today, ${fmt(billing.paidTokens)} from your plan. Current plan: <b>${billing.planName}</b>${period}.`;
+    $('#balanceLine').innerHTML = billing.unlimited
+      ? `<b>Admin · Unlimited</b> — as the site owner you are never charged tokens. Current plan: <b>Admin</b>.`
+      : `<b>${fmt(billing.balance)} tokens</b> available — ${fmt(billing.freeLeft)} free left today, ${fmt(billing.paidTokens)} from your plan. Current plan: <b>${billing.planName}</b>${period}.`;
   } else {
     $('#tokenChip').classList.add('hidden');
   }
@@ -81,6 +85,8 @@ async function renderPlans() {
     const isCurrent = plan === current;
     card.classList.toggle('current', isCurrent);
     if (!btn) return;
+    // Admins never pay (v1.3.2) — no plan buttons for the site owner.
+    if (billing && billing.unlimited) { btn.disabled = true; btn.textContent = plan === 'free' ? 'Admin — unlimited' : 'Admin — included'; return; }
     if (plan === 'free') {
       if (!me || !me.loggedIn) {
         btn.textContent = 'Get started free';

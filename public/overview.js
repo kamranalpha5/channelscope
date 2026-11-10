@@ -58,7 +58,9 @@ async function loadMe() {
       try {
         const b = await api('/api/billing/me');
         tc.classList.remove('hidden');
-        tc.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v10M15 9.5c0-1.4-1.3-2.5-3-2.5s-3 1.1-3 2.5 1 2 3 2.5 3 1.1 3 2.5-1.3 2.5-3 2.5-3-1.1-3-2.5"/></svg><a href="/pricing.html">${fmt(b.balance)} tokens · ${b.planName}</a>`;
+        // Admins never pay tokens (v1.3.2) — the chip says so.
+        const label = b.unlimited ? 'Admin · Unlimited' : `${fmt(b.balance)} tokens · ${b.planName}`;
+        tc.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v10M15 9.5c0-1.4-1.3-2.5-3-2.5s-3 1.1-3 2.5 1 2 3 2.5 3 1.1 3 2.5-1.3 2.5-3 2.5-3-1.1-3-2.5"/></svg><a href="/pricing.html">${label}</a>`;
       } catch (e) { tc.classList.add('hidden'); }
     } else {
       tc.classList.add('hidden');

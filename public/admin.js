@@ -85,7 +85,7 @@ async function loadUsers() {
   try {
     const r = await api('/api/auth/admin/users');
     $('#userTable').innerHTML = r.users.length ? `<table class="users-table"><thead><tr><th>Email</th><th>Role</th><th>Plan</th><th>Balance</th><th>Free left today</th><th>Paid tokens</th><th>Period ends</th></tr></thead><tbody>` + r.users.map(u => `
-      <tr><td>${u.email}</td><td>${u.role}</td><td>${u.planName}</td><td>${u.balance.toLocaleString()}</td><td>${u.freeLeft.toLocaleString()}</td><td>${u.paidTokens.toLocaleString()}</td><td>${u.periodEnd ? new Date(u.periodEnd).toLocaleDateString() : '—'}</td></tr>`).join('') + `</tbody></table>`
+      <tr><td>${u.email}</td><td>${u.role}</td><td>${u.planName}</td><td>${u.unlimited ? 'Unlimited' : u.balance.toLocaleString()}</td><td>${u.freeLeft.toLocaleString()}</td><td>${u.paidTokens.toLocaleString()}</td><td>${u.periodEnd ? new Date(u.periodEnd).toLocaleDateString() : '—'}</td></tr>`).join('') + `</tbody></table>`
       : '<p class="muted">No users yet.</p>';
   } catch (e) { $('#userTable').innerHTML = '<p class="muted">Could not load users.</p>'; }
 }

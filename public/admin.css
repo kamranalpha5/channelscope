@@ -1,13 +1,13 @@
 /* ChannelScope — Admin panel (direct URL only, never linked from public pages).
-   Minimal functional stylesheet in the ChannelScope design system
-   (deep-navy + sky-blue + amber). A full polish pass is tracked separately. */
+   Uses the shared design system (design.css) — deep-navy + sky-blue + amber. */
 :root {
-  --bg: #0a1628; --panel: #0e1f38; --panel2: #0b1a33; --line: #1e3a5f;
-  --blue: #38bdf8; --amber: #f5b942; --text: #e8f0fa; --muted: #8aa3c0;
-  --green: #34d399; --red: #f87171;
+  /* tokens come from design.css — aliases for the shared palette. */
+  --bg: #0a1428; --panel: #12233f; --panel2: #0b1a33; --line: #1e3a5f;
+  --blue: #38bdf8; --amber: #f59e0b; --text: #e8f0fa; --muted: #93a7c4;
+  --green: #22c55e; --red: #ef4444;
 }
 * { box-sizing: border-box; }
-body { margin: 0; background: var(--bg); color: var(--text); font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; line-height: 1.5; }
+body { margin: 0; background: var(--bg); color: var(--text); font-family: var(--font); line-height: 1.5; }
 a { color: var(--blue); text-decoration: none; }
 .hidden { display: none !important; }
 .admin-wrap { max-width: 860px; margin: 0 auto; padding: 20px 16px 40px; }

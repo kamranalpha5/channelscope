@@ -1,11 +1,13 @@
 /* ChannelScope — Overview page (same brand as the Map app: deep navy, sky blue, amber) */
 :root {
-  --bg: #0a1628; --panel: #0e1f38; --panel2: #0b1a33; --line: #1e3a5f;
-  --blue: #38bdf8; --amber: #f5b942; --text: #e8f0fa; --muted: #8aa3c0;
-  --green: #34d399; --red: #f87171;
+  /* tokens come from design.css — these aliases keep the page's local
+     variable names working with the single shared palette. */
+  --bg: #0a1428; --panel: #12233f; --panel2: #0b1a33; --line: #1e3a5f;
+  --blue: #38bdf8; --amber: #f59e0b; --text: #e8f0fa; --muted: #93a7c4;
+  --green: #22c55e; --red: #ef4444;
 }
 * { box-sizing: border-box; }
-body { margin: 0; background: var(--bg); color: var(--text); font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+body { margin: 0; background: var(--bg); color: var(--text); font-family: var(--font); }
 a { color: var(--blue); text-decoration: none; }
 button { cursor: pointer; }
 
@@ -28,7 +30,7 @@ button { cursor: pointer; }
 
 .main { margin-left: 220px; padding: 0 28px 40px; max-width: 1180px; }
 .topbar { display: flex; align-items: center; gap: 14px; padding: 18px 0 6px; }
-.topbar h1 { margin: 0; font-size: 26px; flex: 1; }
+.topbar h1 { margin: 0; font-size: 28px; flex: 1; }
 .userchip { color: var(--muted); font-size: 14px; }
 .btn {
   background: #12294a; color: var(--text); border: 1px solid var(--line);
