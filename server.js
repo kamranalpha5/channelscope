@@ -19,6 +19,38 @@ const SETTINGS_FILE = path.join(DATA_DIR, 'settings.json');
 const MAPS_FILE = path.join(DATA_DIR, 'maps.json');
 const YT = 'https://www.googleapis.com/youtube/v3';
 const QUOTA_LIMIT = 10000;
+// YouTube has a SEPARATE, much smaller quota for search.list: "Search Queries
+// per day" = 100 (the 10,000-unit quota does NOT cover it). Live finding
+// 2026-11-11 (Cloud Console, project NexGen): usage was 112/100 — OVER
+// LIMIT — which is why search.list fails while channels/videos work.
+// Everything below is built around that number: searches are cached per day
+// and guarded, so the site never burns a search call it does not need.
+const SEARCH_LIMIT = 100;
+
+// ---------- Stripe billing (webhook FIRST — before express.json) ----------
+// Stripe verifies the webhook signature over the RAW request body, so this
+// route must be registered before express.json() parses the body. If Stripe
+// is not configured (no STRIPE_SECRET_KEY), the route answers 503 and
+// payments stay disabled — the rest of the site works normally.
+app.post('/api/billing/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+  const stripe = getStripe();
+  const secret = process.env.STRIPE_WEBHOOK_SECRET;
+  if (!stripe || !secret) return res.status(503).json({ ok: false, error: 'Payments are not configured.' });
+  const sig = req.headers['stripe-signature'];
+  let event;
+  try {
+    event = stripe.webhooks.constructEvent(req.body, sig, secret);
+  } catch (e) {
+    console.error('Stripe webhook signature verification failed:', e.message);
+    return res.status(400).json({ ok: false, error: 'Invalid signature.' });
+  }
+  try { await handleStripeEvent(event); } catch (e) { console.error('Stripe webhook handler failed:', e.message); }
+  res.json({ received: true });
+});
+
+// Privacy Policy — public page (no login, no allowlist). Required for the
+// YouTube Audit and Quota Extension Form: https://<host>/privacy
+app.get('/privacy', (req, res) => res.sendFile(path.join(__dirname, 'public', 'privacy.html')));
 
 app.use(express.json({ limit: '1mb' }));
 app.use(express.static(path.join(__dirname, 'public')));
@@ -123,7 +155,7 @@ function ensureAdminFromEnv() {
   saveUsers(store);
   console.log('Admin account created from env for', email);
 }
-const ACCESS_NOTE = 'Ye data sirf allowed users ko dikhta hai — access ke liye admin se rabta karo.';
+const ACCESS_NOTE = 'This data is only visible to users with access — contact the site owner for access.';
 // SERVER-SIDE MASKING: non-allowed users never receive real channel/video
 // data in Overview/Trending responses — names become "•••", DPs/numbers null.
 // CSS blur alone would still leak the data in the JSON; this does not.
@@ -143,12 +175,73 @@ function maskTrendingChannel(c) {
 
 function quotaResetIfNeeded(s) {
   if (s.quotaDate !== todayStr()) { s.quotaUsed = 0; s.quotaDate = todayStr(); }
+  if (s.searchDate !== todayStr()) { s.searchUsed = 0; s.searchDate = todayStr(); }
   return s;
 }
 function addQuota(s, units) {
   quotaResetIfNeeded(s);
   s.quotaUsed = (s.quotaUsed || 0) + units;
   saveSettingsSoon(s);
+}
+// One real search.list call = 1 of the 100 daily searches. Call this at every
+// search site (resolve fallback, neighbour discovery, trending) — and ONLY
+// there, never for a cached result. Charged BEFORE the call: Google counts a
+// search that reaches the API even when it answers quotaExceeded, so
+// counting only successes would under-report exactly when it matters most.
+// (An invalid-key call is likely not counted by Google, so the counter can
+// run slightly high until the key is fixed — conservative and self-correcting
+// at the daily reset.)
+function chargeSearch(settings) {
+  quotaResetIfNeeded(settings);
+  settings.searchUsed = (settings.searchUsed || 0) + 1;
+  saveSettingsSoon(settings);
+}
+function searchRemaining(settings) {
+  quotaResetIfNeeded(settings);
+  return SEARCH_LIMIT - (settings.searchUsed || 0);
+}
+// Fail fast before starting work the search quota cannot cover, so the user
+// never pays tokens for a build that is doomed to stall on search.
+function searchGuardError(settings, needed) {
+  const left = searchRemaining(settings);
+  if (left < needed) {
+    return `Daily search quota is exhausted — only ${left} of ${SEARCH_LIMIT} search calls remain today. Please try again tomorrow.`;
+  }
+  return null;
+}
+// Plain-English hint appended whenever YouTube answers quotaExceeded on a
+// search — the raw error is still surfaced alongside it (see /api/diag).
+function quotaExceededHint(ytErr) {
+  return ytErr && ytErr.reason === 'quotaExceeded' ? ' The daily search quota (100 searches/day) is exhausted — please try again tomorrow.' : '';
+}
+
+// ---------- daily search cache ----------
+// The same query (same type) is never paid for twice in one day. This is the
+// big saving: a Depth-2 map's ring 2 re-searches ring 1's exact queries, so
+// with the cache it costs 0 searches; a retried stalled ring costs 0 too.
+// Cache file: data/search-cache.json (gitignored). Entries expire daily.
+// Values are the minimal data each caller needs (channel IDs / video objects).
+// All helpers are synchronous (read-modify-write with no await inside) so
+// parallel search jobs can never clobber each other's entries.
+const SEARCH_CACHE_FILE = path.join(DATA_DIR, 'search-cache.json');
+const SEARCH_CACHE_MAX = 1000;
+function getSearchCache() {
+  const c = loadJson(SEARCH_CACHE_FILE, { date: '', entries: {} });
+  if (c.date !== todayStr()) return { date: todayStr(), entries: {} };
+  return c;
+}
+function searchCacheKey(kind, q) { return kind + '|' + String(q || '').trim().toLowerCase(); }
+function searchCacheGet(kind, q) {
+  const c = getSearchCache();
+  const v = c.entries[searchCacheKey(kind, q)];
+  return v === undefined ? null : v;
+}
+function searchCacheSet(kind, q, value) {
+  const c = getSearchCache();
+  c.entries[searchCacheKey(kind, q)] = value;
+  const keys = Object.keys(c.entries);
+  if (keys.length > SEARCH_CACHE_MAX) { for (const k of keys.slice(0, keys.length - SEARCH_CACHE_MAX)) delete c.entries[k]; }
+  saveJson(SEARCH_CACHE_FILE, c);
 }
 // Disk writes are debounced: parallel API storms used to do one sync write per
 // call (and parallel increments could clobber each other). Flushed at the end
@@ -158,6 +251,108 @@ function saveSettingsSoon(s) {
   if (settingsSaveTimer) return;
   settingsSaveTimer = setTimeout(() => { settingsSaveTimer = null; try { saveSettings(s); } catch (e) { /* ignore */ } }, 400);
 }
+// ---------- tokens + quota protection ----------
+// TOKEN MODEL (v1.3.1): tokens are the site's own currency. Every logged-in
+// user gets 100 free tokens per day (refreshes every 24h, never accumulates).
+// Paid plans (Stripe, monthly) add a monthly grant: Starter $2/mo = 1,500
+// tokens/mo, Pro $5/mo = 5,000 tokens/mo. Costs: map build Depth 1 = 50,
+// Depth 2 = 100, Depth 4 = 200 tokens; a fresh Trending 24h run = 50.
+// Cached data (Overview panels, existing maps, breakouts, results, JSON
+// download, script replicate) costs 0 tokens. Building needs login + tokens
+// — the allowlist only controls Overview blur/unblur, NOT building.
+// The global YouTube quota guard still applies on top: the server never
+// spends more than the shared daily YouTube quota (10,000 units/day by
+// default), even if the user still has tokens.
+const FREE_DAILY_TOKENS = 100;
+const PLANS = {
+  starter: { id: 'starter', name: 'Starter', price: 2, tokens: 1500, priceEnv: 'STRIPE_PRICE_1500' },
+  pro: { id: 'pro', name: 'Pro', price: 5, tokens: 5000, priceEnv: 'STRIPE_PRICE_5000' }
+};
+const TOKEN_COST = { 1: 50, 2: 100, 4: 200, trending: 50 };
+// User billing fields (data/users.json, all optional — missing fields mean
+// the free plan with no paid tokens): plan ('free'|'starter'|'pro'),
+// paidTokens, freeUsed, freeDate, periodEnd, stripeCustomerId,
+// stripeSubscriptionId.
+function tokenStateFor(user, today) {
+  const freeUsed = (user.freeDate === today) ? (user.freeUsed || 0) : 0;
+  const freeLeft = Math.max(0, FREE_DAILY_TOKENS - freeUsed);
+  const paidTokens = user.paidTokens || 0;
+  const plan = PLANS[user.plan] || null;
+  return {
+    plan: user.plan || 'free', planName: plan ? plan.name : 'Free',
+    freeAllowance: FREE_DAILY_TOKENS, freeUsed, freeLeft,
+    paidTokens, balance: freeLeft + paidTokens,
+    periodEnd: user.periodEnd || null
+  };
+}
+function tokenState(email) {
+  const store = getUsers();
+  const user = store.users.find(u => u.email === normEmail(email));
+  if (!user) return null;
+  return tokenStateFor(user, todayStr());
+}
+function checkTokens(email, amount) {
+  const st = tokenState(email);
+  if (!st) return 'Please log in to continue.';
+  if (st.balance < amount) {
+    return `Not enough tokens — this costs ${amount} tokens and your balance is ${st.balance}. Your free allowance of ${FREE_DAILY_TOKENS} tokens refreshes tomorrow, or upgrade your plan for more.`;
+  }
+  return null;
+}
+// Spend tokens: free daily allowance first (it expires), then paid tokens.
+// Returns {ok, balance, freeTaken, paidTaken} or {ok:false, error}.
+function spendTokens(email, amount) {
+  const store = getUsers();
+  const user = store.users.find(u => u.email === normEmail(email));
+  if (!user) return { ok: false, error: 'Please log in to continue.' };
+  const today = todayStr();
+  const st = tokenStateFor(user, today);
+  if (st.balance < amount) return { ok: false, error: `Not enough tokens — this costs ${amount} tokens and your balance is ${st.balance}.`, balance: st.balance };
+  let remaining = amount;
+  const freeTaken = Math.min(st.freeLeft, remaining);
+  user.freeUsed = ((user.freeDate === today) ? (user.freeUsed || 0) : 0) + freeTaken;
+  user.freeDate = today;
+  remaining -= freeTaken;
+  const paidTaken = remaining;
+  if (paidTaken > 0) user.paidTokens = (user.paidTokens || 0) - paidTaken;
+  saveUsers(store);
+  return { ok: true, balance: st.balance - amount, freeTaken, paidTaken };
+}
+// Reverse a spend (e.g. a build that was charged but then failed).
+function refundTokens(email, freeTaken, paidTaken) {
+  const store = getUsers();
+  const user = store.users.find(u => u.email === normEmail(email));
+  if (!user) return;
+  const today = todayStr();
+  if (freeTaken > 0 && user.freeDate === today) user.freeUsed = Math.max(0, (user.freeUsed || 0) - freeTaken);
+  if (paidTaken > 0) user.paidTokens = (user.paidTokens || 0) + paidTaken;
+  saveUsers(store);
+}
+// Cost estimates (measured: one Depth-2 map ≈ 2,283 units; a trending run
+// ≈ 335 units). Deliberately conservative so the guard trips before the
+// shared daily quota is actually gone.
+function estimateForDepth(depth) { return depth >= 4 ? 5000 : depth >= 2 ? 3000 : 1600; }
+function estimateForRing() { return 1600; }
+function estimateForTrending() { return 500; }
+function quotaRemaining(settings) {
+  quotaResetIfNeeded(settings);
+  return QUOTA_LIMIT - (settings.quotaUsed || 0);
+}
+function quotaGuardError(settings, estimate) {
+  if (quotaRemaining(settings) < estimate) {
+    return 'Daily quota is nearly exhausted — please try again tomorrow.';
+  }
+  return null;
+}
+// Gate for starting a new build/scan: must be logged in (the allowlist
+// does NOT gate building — it only controls Overview blur/unblur).
+// Returns the auth object or sends the error.
+function requireLogin(req, res) {
+  const auth = getAuth(req);
+  if (!auth.loggedIn) { res.status(401).json({ ok: false, error: 'Please log in to build maps.', needLogin: true }); return null; }
+  return auth;
+}
+
 function flushSettings(s) {
   if (settingsSaveTimer) { clearTimeout(settingsSaveTimer); settingsSaveTimer = null; }
   try { saveSettings(s); } catch (e) { /* ignore */ }
@@ -177,10 +372,28 @@ async function mapPool(items, fn, limit) {
   return out;
 }
 
-// ---------- YouTube API client (key via header, never in a URL) ----------
+// ---------- YouTube API client ----------
+// Auth: the key is sent BOTH as the documented `?key=` query parameter AND
+// as the `X-goog-api-key` header. The header alone was verified working for
+// search.list (dummy-key test: 400 API_KEY_INVALID on both hosts), but the
+// query parameter is the documented method — sending both removes any
+// gateway/header-stripping quirk as a variable. The key never appears in
+// any log or error payload (see recordYtError — endpoint + reason only).
+// Every YouTube failure is recorded (status + reason + message) so the exact
+// cause is visible in server logs, API responses and GET /api/diag instead
+// of a generic "searches failed" guess.
+const lastYtErrors = []; // newest first, max 5 — no keys, no URLs, no bodies
+function recordYtError(endpoint, status, reason, message) {
+  const e = { endpoint, status, reason, message: String(message || '').slice(0, 300), at: new Date().toISOString() };
+  lastYtErrors.unshift(e);
+  if (lastYtErrors.length > 5) lastYtErrors.pop();
+  console.error(`[yt-error] ${endpoint} -> ${status} ${reason}: ${e.message}`);
+  return e;
+}
 async function yt(endpoint, params, key) {
   const url = new URL(YT + endpoint);
   for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
+  url.searchParams.set('key', key);
   const res = await fetch(url.toString(), {
     headers: { 'X-goog-api-key': key, 'Accept': 'application/json' }
   });
@@ -188,9 +401,16 @@ async function yt(endpoint, params, key) {
   let data = null;
   try { data = JSON.parse(text); } catch (e) { /* ignore */ }
   if (!res.ok) {
-    const msg = (data && data.error && data.error.message) || ('YouTube API error ' + res.status);
+    const errBody = (data && data.error) || {};
+    const reason = (errBody.errors && errBody.errors[0] && errBody.errors[0].reason)
+      || (errBody.details && errBody.details.find(d => d.reason) && errBody.details.find(d => d.reason).reason)
+      || errBody.status || ('HTTP_' + res.status);
+    const msg = errBody.message || ('YouTube API error ' + res.status);
     const err = new Error(msg);
     err.status = res.status;
+    err.reason = reason;
+    err.endpoint = endpoint;
+    err.yt = recordYtError(endpoint, res.status, reason, msg);
     err.isInvalidKey = res.status === 400 && /API key not valid/i.test(msg);
     throw err;
   }
@@ -308,6 +528,8 @@ function escHtml(s) {
 }
 function cap(s) { s = String(s || ''); return s ? s.charAt(0).toUpperCase() + s.slice(1) : s; }
 function fmt(n) { return (+n || 0).toLocaleString(); }
+// Subscriber counts: null (hidden/unknown) renders as "—", never as 0.
+function fmtSubs(n) { return n == null ? '—' : fmt(n); }
 
 // ---------- channel resolution ----------
 function parseChannelInput(input) {
@@ -326,7 +548,7 @@ function parseChannelInput(input) {
 
 async function resolveChannel(input, key, settings) {
   const parsed = parseChannelInput(input);
-  if (!parsed) throw new Error('Channel handle, URL ya ID likho (jaise @EconomyPuzzle).');
+  if (!parsed) throw new Error('Enter a channel handle, URL or ID (e.g. @EconomyPuzzle).');
   let channelId = null;
   if (parsed.type === 'id') {
     channelId = parsed.value;
@@ -336,13 +558,22 @@ async function resolveChannel(input, key, settings) {
     if (d.items && d.items.length) channelId = d.items[0].id;
   }
   if (!channelId) {
-    // Fallback: search by name/handle text (100 units).
-    const d = await yt('/search', { part: 'snippet', type: 'channel', q: parsed.value.replace(/^@/, ''), maxResults: 5 }, key);
-    addQuota(settings, ytCost('/search'));
-    const exact = (d.items || []).find(it =>
-      (it.snippet.channelTitle || '').toLowerCase() === parsed.value.replace(/^@/, '').toLowerCase());
-    channelId = (exact || (d.items || [])[0] || {}).channelId || (d.items && d.items[0] && d.items[0].snippet && d.items[0].snippet.channelId);
-    if (!channelId) throw new Error('Channel nahi mila: ' + input);
+    // Fallback: search by name/handle text (100 units) — cached per day,
+    // so a retried seed never pays for the same lookup twice.
+    const cacheKey = parsed.value.replace(/^@/, '');
+    const cached = searchCacheGet('resolve', cacheKey);
+    if (cached) {
+      channelId = cached;
+    } else {
+      chargeSearch(settings);
+      const d = await yt('/search', { part: 'snippet', type: 'channel', q: cacheKey, maxResults: 5 }, key);
+      addQuota(settings, ytCost('/search'));
+      const exact = (d.items || []).find(it =>
+        (it.snippet.channelTitle || '').toLowerCase() === cacheKey.toLowerCase());
+      channelId = (exact || (d.items || [])[0] || {}).channelId || (d.items && d.items[0] && d.items[0].snippet && d.items[0].snippet.channelId);
+      if (channelId) searchCacheSet('resolve', cacheKey, channelId);
+    }
+    if (!channelId) throw new Error('Channel not found: ' + input);
   }
   return channelId;
 }
@@ -419,7 +650,12 @@ function channelSummary(item, videos) {
   const views = videos.map(v => v.views);
   const med = median(views);
   const totalViews = +(st.viewCount || 0);
-  const subs = +(st.subscriberCount || 0);
+  // Subscriber count: null when hidden or absent. YouTube OMITS
+  // statistics.subscriberCount for channels that hide it (e.g.
+  // @BedrockTimelapse — its public page shows no subscriber count), so
+  // coercing to 0 made the UI print a wrong "0 subs". Null means unknown
+  // and renders as "—" everywhere; it must never display as 0.
+  const subs = (st.hiddenSubscriberCount || st.subscriberCount == null) ? null : +st.subscriberCount;
   const published = sn.publishedAt ? new Date(sn.publishedAt) : null;
   const ageDays = published ? Math.max(1, Math.round((Date.now() - published.getTime()) / 86400000)) : 0;
   return {
@@ -481,7 +717,7 @@ function deriveNiche(seedChannel, seedVideos) {
     keywords = [...new Set([...catToks, ...descLong])].slice(0, 12);
   }
   // Never build on an empty niche — the route turns this into a clear error.
-  if (keywords.length === 0) throw new Error('Niche derive nahi ho saki — seed channel ki videos/tags mein koi usable keyword nahi mila. Koi aur seed channel try karo.');
+  if (keywords.length === 0) throw new Error('Could not derive a niche — no usable keyword found in the seed channel videos or tags. Try a different seed channel.');
   const categories = seedChannel.topicCategories || [];
   const allText = seedVideos.map(v => v.title).join(' ') + ' ' + seedChannel.title + ' ' + (seedChannel.description || '');
   const family = detectLangFamily(allText);
@@ -504,25 +740,60 @@ function nicheTest(candidate, candidateVideos, niche) {
   return { pass, hits, catHit, langOk, candFamily };
 }
 
+// Search jobs for a niche: up to 6 keywords x (channel + video) = 12 calls
+// per ring. Shared by discoverNeighbours and the search-quota guard, so the
+// guard counts exactly what the ring will spend.
+function searchJobsForNiche(niche) {
+  const jobs = [];
+  for (const q of (niche.keywords || []).slice(0, 6)) { jobs.push({ q, type: 'channel' }); jobs.push({ q, type: 'video' }); }
+  return jobs;
+}
+function uncachedSearchCount(jobs) {
+  let n = 0;
+  for (const job of jobs) { if (searchCacheGet(job.type === 'channel' ? 'ch' : 'vid', job.q) === null) n++; }
+  return n;
+}
+
 async function discoverNeighbours(niche, excludeIds, limit, key, settings) {
   const found = [];
   const seen = new Set(excludeIds);
-  const diagnostics = { searchesRun: 0, searchesOk: 0, searchesFailed: 0, candidatesFound: 0, vettedPassed: 0 };
+  const diagnostics = { searchesRun: 0, searchesOk: 0, searchesFailed: 0, searchesCached: 0, candidatesFound: 0, vettedPassed: 0, firstSearchError: null, noQueries: false };
   // Build-scoped cache: a channel/video is never fetched twice in one build.
   const cache = { channels: new Map(), videos: new Map() };
   // Search each top niche keyword for channels + videos (keyword-anchored, never relatedToVideoId).
   // The 12 searches used to run one-by-one; they now run in a pool of 6.
-  const queries = niche.keywords.slice(0, 6);
-  const searchJobs = [];
-  for (const q of queries) { searchJobs.push({ q, type: 'channel' }); searchJobs.push({ q, type: 'video' }); }
+  // The daily search cache serves repeats for free: ring 2 re-searches ring
+  // 1's exact queries, so it costs 0 searches (same results — a live re-search
+  // minutes later returns the same IDs anyway).
+  const queries = (niche.keywords || []).slice(0, 6);
+  if (!queries.length) {
+    // No search was ever attempted — report that explicitly instead of
+    // letting the caller guess "searches failed" (v1.3.0 misdiagnosed this).
+    diagnostics.noQueries = true;
+    return { neighbours: [], diagnostics };
+  }
+  const searchJobs = searchJobsForNiche(niche);
   const searchResults = await mapPool(searchJobs, async (job) => {
+    const kind = job.type === 'channel' ? 'ch' : 'vid';
+    const cached = searchCacheGet(kind, job.q);
+    if (cached !== null) { diagnostics.searchesCached++; return cached; }
     diagnostics.searchesRun++;
     try {
+      chargeSearch(settings);
       const d = await yt('/search', { part: 'snippet', type: job.type, q: job.q, maxResults: 10 }, key);
       addQuota(settings, ytCost('/search'));
       diagnostics.searchesOk++;
-      return (d.items || []).map(it => it.snippet.channelId).filter(Boolean);
-    } catch (e) { diagnostics.searchesFailed++; return []; } // one failed keyword must not kill the build
+      const ids = (d.items || []).map(it => it.snippet.channelId).filter(Boolean);
+      searchCacheSet(kind, job.q, ids);
+      return ids;
+    } catch (e) {
+      diagnostics.searchesFailed++;
+      // Keep the FIRST search error — it is the real reason the ring failed
+      // (status + reason + message, never the key). One failed keyword must
+      // not kill the build, but the reason must not be swallowed either.
+      if (!diagnostics.firstSearchError) diagnostics.firstSearchError = { status: e.status || null, reason: e.reason || null, message: e.message || 'Search request failed', q: job.q, type: job.type };
+      return [];
+    }
   }, 6);
   const candidateIds = [];
   for (const ids of searchResults) {
@@ -563,7 +834,9 @@ async function discoverNeighbours(niche, excludeIds, limit, key, settings) {
 function needKey(res) {
   const s = quotaResetIfNeeded(getSettings());
   if (!s.apiKey) {
-    res.status(400).json({ ok: false, error: 'API key saved nahi hai. Pehle Settings mein apni YouTube Data API v3 key daalo.' });
+    // Single-key model: only the owner's key runs the site. Visitors are
+    // never asked for a key — they get this friendly message instead.
+    res.status(503).json({ ok: false, error: 'Service is being set up — please try again later.' });
     return null;
   }
   return s;
@@ -635,29 +908,68 @@ app.get('/api/thumb', async (req, res) => {
   } catch (e) { res.status(502).send('thumbnail fetch failed'); }
 });
 
+// ---------- admin panel (separate page, direct URL only) ----------
+// /admin serves the admin panel: allowlist + the site's one YouTube API
+// key. It is NEVER linked from any public page — the admin opens it
+// directly. The page itself only reveals its sections after an admin
+// login (or the first-run setup form while no admin exists yet).
+app.get('/admin', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'admin.html'));
+});
+
 // ---------- settings / API key ----------
 app.get('/api/status', (req, res) => {
   const s = quotaResetIfNeeded(getSettings());
-  res.json({ ok: true, hasKey: !!s.apiKey, quotaUsed: s.quotaUsed || 0, quotaLimit: QUOTA_LIMIT, quotaDate: s.quotaDate });
+  const auth = getAuth(req);
+  // Quota display: shared quota + the caller's own token balance.
+  const tokens = auth.loggedIn ? tokenState(auth.email) : null;
+  res.json({
+    ok: true, hasKey: !!s.apiKey, quotaUsed: s.quotaUsed || 0, quotaLimit: QUOTA_LIMIT, quotaDate: s.quotaDate,
+    quotaRemaining: QUOTA_LIMIT - (s.quotaUsed || 0),
+    searchUsed: s.searchUsed || 0, searchLimit: SEARCH_LIMIT,
+    searchRemaining: SEARCH_LIMIT - (s.searchUsed || 0),
+    me: { loggedIn: auth.loggedIn, email: auth.email, role: auth.role, allowed: auth.allowed },
+    tokens
+  });
+});
+
+// Diagnostics: key/quota state + the last YouTube errors (status/reason/
+// message + endpoint + time) + per-map build state. No secrets ever —
+// no key, no URLs, no request bodies. Use this first when a build fails.
+app.get('/api/diag', (req, res) => {
+  const s = quotaResetIfNeeded(getSettings());
+  const maps = sortMapsNewest(getMaps()).map(m => ({
+    id: m.id, seedTitle: m.seedTitle, status: m.status, builtDepth: m.builtDepth,
+    channelCount: m.channels.length, nicheKeywords: m.nicheKeywords || [],
+    stall: m.stall || null, createdAt: m.createdAt
+  }));
+  res.json({
+    ok: true, hasKey: !!s.apiKey, quotaUsed: s.quotaUsed || 0, quotaLimit: QUOTA_LIMIT, quotaDate: s.quotaDate,
+    searchUsed: s.searchUsed || 0, searchLimit: SEARCH_LIMIT,
+    lastYtError: lastYtErrors[0] || null, recentYtErrors: lastYtErrors, maps
+  });
 });
 
 app.post('/api/settings/key', async (req, res) => {
+  // Single-key model: only the admin sets the site's one YouTube API key.
+  if (!requireAdmin(req, res)) return;
   const key = (req.body && req.body.key || '').trim();
-  if (!key) return res.status(400).json({ ok: false, error: 'Key khaali hai.' });
+  if (!key) return res.status(400).json({ ok: false, error: 'Key is empty.' });
   // Validate with one cheap 1-unit call.
   try {
     await yt('/channels', { part: 'id', id: 'UC_x5XG1OV2P6uZZ5FSM9Ttw' }, key);
   } catch (e) {
-    if (e.isInvalidKey) return res.status(400).json({ ok: false, error: 'API key not valid — Google ne key reject kar di. Key dobara check karo.' });
-    return res.status(400).json({ ok: false, error: 'Key check nahi ho saki: ' + e.message });
+    if (e.isInvalidKey) return res.status(400).json({ ok: false, error: 'API key not valid — Google rejected the key. Please check the key and try again.' });
+    return res.status(400).json({ ok: false, error: 'Key check failed: ' + e.message });
   }
   const s = quotaResetIfNeeded(getSettings());
   s.apiKey = key;
   saveSettings(s);
-  res.json({ ok: true, message: 'API key save ho gayi (sirf is PC par).' });
+  res.json({ ok: true, message: 'API key saved.' });
 });
 
 app.delete('/api/settings/key', (req, res) => {
+  if (!requireAdmin(req, res)) return;
   const s = getSettings();
   s.apiKey = '';
   saveSettings(s);
@@ -686,13 +998,13 @@ app.delete('/api/maps', (req, res) => {
 
 app.get('/api/maps/:id', (req, res) => {
   const { map } = findMap(req.params.id);
-  if (!map) return res.status(404).json({ ok: false, error: 'Map nahi mila.' });
+  if (!map) return res.status(404).json({ ok: false, error: 'Map not found.' });
   res.json({ ok: true, map });
 });
 
 app.delete('/api/maps/:id', (req, res) => {
   const { map } = findMap(req.params.id);
-  if (!map) return res.status(404).json({ ok: false, error: 'Map nahi mila.' });
+  if (!map) return res.status(404).json({ ok: false, error: 'Map not found.' });
   deleteMapById(map.id);
   res.json({ ok: true });
 });
@@ -703,11 +1015,26 @@ app.post('/api/maps', async (req, res) => {
   if (!settings) return;
   const input = (req.body && req.body.input || '').trim();
   const depth = [1, 2, 4].includes(+req.body.depth) ? +req.body.depth : 2;
-  if (!input) return res.status(400).json({ ok: false, error: 'Channel handle, URL ya ID likho.' });
+  if (!input) return res.status(400).json({ ok: false, error: 'Enter a channel handle, URL or ID.' });
+  // Token + quota protection: only logged-in users may start a build, with
+  // enough tokens for the depth, and only if the shared quota can cover it.
+  // The allowlist does NOT gate building.
+  const auth = requireLogin(req, res);
+  if (!auth) return;
+  const cost = TOKEN_COST[depth];
+  const tokenErr = checkTokens(auth.email, cost);
+  if (tokenErr) return res.status(402).json({ ok: false, error: tokenErr, needTokens: true, cost });
+  const guardErr = quotaGuardError(settings, estimateForDepth(depth));
+  if (guardErr) return res.status(503).json({ ok: false, error: guardErr });
+  // Search guard: the build needs at least one search call (seed resolution
+  // + the first ring). Never charge tokens for a build the search quota
+  // cannot cover.
+  const searchErr = searchGuardError(settings, 1);
+  if (searchErr) return res.status(503).json({ ok: false, error: searchErr });
   try {
     const channelId = await resolveChannel(input, settings.apiKey, settings);
     const details = await fetchChannelDetails([channelId], settings.apiKey, settings);
-    if (!details.length) return res.status(404).json({ ok: false, error: 'Channel nahi mila.' });
+    if (!details.length) return res.status(404).json({ ok: false, error: 'Channel not found.' });
     const item = details[0];
     const seedVideos = await fetchChannelVideos(channelId, (item.contentDetails.relatedPlaylists || {}).uploads, settings.apiKey, settings, 20);
     const seed = channelSummary(item, seedVideos);
@@ -726,10 +1053,18 @@ app.post('/api/maps', async (req, res) => {
       channels: [Object.assign(seed, { depth: 0 })]
     };
     upsertMap(map);
+    // Charge only after the seed resolved — a failed seed never costs tokens.
+    // (Race safety: if the charge fails, the just-created map is removed.)
+    const spent = spendTokens(auth.email, cost);
+    if (!spent.ok) {
+      deleteMapById(map.id);
+      flushSettings(settings);
+      return res.status(402).json({ ok: false, error: spent.error, needTokens: true, cost });
+    }
     flushSettings(settings);
-    res.json({ ok: true, map, message: 'Seed mil gaya — ab rings bhar rahe hain.' });
+    res.json({ ok: true, map, message: 'Seed found — building the rings now.', tokens: { balance: spent.balance, spent: cost } });
   } catch (e) {
-    res.status(e.status === 403 ? 403 : 400).json({ ok: false, error: e.message || 'Map banate hue error aaya.' });
+    res.status(e.status === 403 ? 403 : 400).json({ ok: false, error: e.message || 'Failed to create the map.' });
   }
 });
 
@@ -738,28 +1073,73 @@ app.post('/api/maps/:id/expand', async (req, res) => {
   const settings = needKey(res);
   if (!settings) return;
   const { map } = findMap(req.params.id);
-  if (!map) return res.status(404).json({ ok: false, error: 'Map nahi mila.' });
+  if (!map) return res.status(404).json({ ok: false, error: 'Map not found.' });
   if (map.status === 'stalled') map.status = 'building'; // retrying a stalled ring
   const target = nextRingTarget(map);
   if (target === null) {
     map.status = 'complete';
     upsertMap(map);
-    return res.json({ ok: true, map, done: true, message: 'Map complete hai.' });
+    return res.json({ ok: true, map, done: true, message: 'Map is complete.' });
   }
+  // Quota protection: continuing a build also needs a logged-in user, and
+  // enough shared quota left for one more ring. Expanding is part of the
+  // build already paid for at creation, so it costs no extra tokens.
+  const expandAuth = requireLogin(req, res);
+  if (!expandAuth) return;
+  const ringGuardErr = quotaGuardError(settings, estimateForRing());
+  if (ringGuardErr) return res.status(503).json({ ok: false, error: ringGuardErr });
   try {
+    const ringDepth = map.builtDepth + 1;
+    // A stored map with no niche keywords can never discover neighbours —
+    // say so plainly instead of running zero searches and blaming YouTube.
+    if (!map.nicheKeywords || !map.nicheKeywords.length) {
+      map.status = 'stalled';
+      map.stall = { ring: ringDepth, reason: 'This map has no niche keywords, so no search could run.', keywords: [], candidatesFound: 0, vettedPassed: 0, searchesOk: 0, searchesFailed: 0, quotaUsed: settings.quotaUsed || 0, at: new Date().toISOString() };
+      upsertMap(map);
+      return res.status(400).json({ ok: false, error: 'This map has no niche keywords, so no search could run. Please build a new map from a seed channel.', diagnostics: { searchesRun: 0, searchesOk: 0, searchesFailed: 0, noQueries: true } });
+    }
     const exclude = map.channels.map(c => c.id);
     const limit = target - map.channels.length;
-    const ringDepth = map.builtDepth + 1;
+    // Search guard: only the ring's UNCACHED searches count — a retried ring
+    // whose queries are in the daily cache needs 0 new searches. If the
+    // quota cannot cover them, stop here (map stays 'building', retryable
+    // tomorrow) instead of stalling on a doomed ring.
+    const ringSearchErr = searchGuardError(settings, uncachedSearchCount(searchJobsForNiche(map.niche)));
+    if (ringSearchErr) return res.status(503).json({ ok: false, error: ringSearchErr });
     const { neighbours, diagnostics } = await discoverNeighbours(map.niche, exclude, Math.max(limit, 0), settings.apiKey, settings);
-    // TOTAL search failure (e.g. quota exhausted): never silently save a
-    // seed-only ring as progress — return a clear error instead. This is the
-    // website-vs-localhost difference: the website build's searches failed and
-    // the old code returned ok:true with 0 neighbours, so the user saw a lone
-    // seed and no explanation.
-    if (diagnostics.searchesOk === 0 && neighbours.length === 0) {
+    // TOTAL search failure: never silently save a seed-only ring as
+    // progress — park the map as 'stalled' WITH the real YouTube reason
+    // (status + reason + message) and return it, so the UI can show what
+    // actually happened instead of guessing "quota may be exhausted".
+    // (Cached searches count as successful searches — a ring served fully
+    // from the cache has searchesOk 0 but is not a failure.)
+    if (diagnostics.searchesOk + (diagnostics.searchesCached || 0) === 0 && neighbours.length === 0) {
+      const ytErr = diagnostics.firstSearchError || null;
+      const human = diagnostics.noQueries
+        ? 'No search ran for this ring — the niche keywords are empty.'
+        : ytErr
+          ? `YouTube search failed (${ytErr.status || ''} ${ytErr.reason || ''}): ${ytErr.message}${quotaExceededHint(ytErr)}`
+          : 'YouTube searches failed for this ring.';
+      map.status = 'stalled';
+      map.stall = {
+        ring: ringDepth,
+        reason: human,
+        yt: ytErr,
+        keywords: map.nicheKeywords || [],
+        candidatesFound: diagnostics.candidatesFound,
+        vettedPassed: diagnostics.vettedPassed,
+        searchesOk: diagnostics.searchesOk,
+        searchesFailed: diagnostics.searchesFailed,
+        searchesCached: diagnostics.searchesCached || 0,
+        quotaUsed: settings.quotaUsed || 0,
+        at: new Date().toISOString()
+      };
       upsertMap(map);
+      flushSettings(settings);
       return res.status(400).json({
-        ok: false, error: 'YouTube searches fail ho gayi hain — quota khatam ho sakti hai ya API ne reject kar diya. Quota check karo aur thodi der baad "Continue building" dabao.',
+        ok: false,
+        error: human + ' Check the quota, then press "Continue building" to retry.',
+        yt: ytErr,
         diagnostics
       });
     }
@@ -770,12 +1150,13 @@ app.post('/api/maps/:id/expand', async (req, res) => {
       map.status = 'stalled';
       map.stall = {
         ring: ringDepth,
-        reason: 'Is ring mein 0 neighbours mile.',
+        reason: 'No neighbours found in this ring.',
         keywords: map.nicheKeywords || [],
         candidatesFound: diagnostics.candidatesFound,
         vettedPassed: diagnostics.vettedPassed,
         searchesOk: diagnostics.searchesOk,
         searchesFailed: diagnostics.searchesFailed,
+        searchesCached: diagnostics.searchesCached || 0,
         quotaUsed: settings.quotaUsed || 0,
         at: new Date().toISOString()
       };
@@ -783,7 +1164,7 @@ app.post('/api/maps/:id/expand', async (req, res) => {
       flushSettings(settings);
       return res.json({
         ok: true, map, done: false, stalled: true, diagnostics,
-        message: `Depth ${ringDepth}: 0 neighbours mile — niche keywords (${(map.nicheKeywords || []).join(', ')}) par ${diagnostics.candidatesFound} candidates mile, ${diagnostics.vettedPassed} niche test pass kar sake.`
+        message: `Depth ${ringDepth}: 0 neighbours found — niche keywords (${(map.nicheKeywords || []).join(', ')}) matched ${diagnostics.candidatesFound} candidates, ${diagnostics.vettedPassed} passed the niche test.`
       });
     }
     for (const n of neighbours) { n.depth = ringDepth; map.channels.push(n); }
@@ -798,7 +1179,7 @@ app.post('/api/maps/:id/expand', async (req, res) => {
       message: `Depth ${ringDepth} of ${map.depth} ready — ${map.channels.length} channels.`
     });
   } catch (e) {
-    res.status(400).json({ ok: false, error: e.message || 'Ring bharte hue error aaya.' });
+    res.status(400).json({ ok: false, error: e.message || 'Failed to build this ring.' });
   }
 });
 
@@ -882,17 +1263,17 @@ function channelBreakdown(ch) {
 
 app.get('/api/maps/:id/channels/:channelId', (req, res) => {
   const { map } = findMap(req.params.id);
-  if (!map) return res.status(404).json({ ok: false, error: 'Map nahi mila.' });
+  if (!map) return res.status(404).json({ ok: false, error: 'Map not found.' });
   const ch = map.channels.find(c => c.id === req.params.channelId);
-  if (!ch) return res.status(404).json({ ok: false, error: 'Channel is map mein nahi hai.' });
+  if (!ch) return res.status(404).json({ ok: false, error: 'Channel is not in this map.' });
   res.json({ ok: true, breakdown: channelBreakdown(ch) });
 });
 
 app.get('/api/maps/:id/channels/:channelId/json', (req, res) => {
   const { map } = findMap(req.params.id);
-  if (!map) return res.status(404).json({ ok: false, error: 'Map nahi mila.' });
+  if (!map) return res.status(404).json({ ok: false, error: 'Map not found.' });
   const ch = map.channels.find(c => c.id === req.params.channelId);
-  if (!ch) return res.status(404).json({ ok: false, error: 'Channel is map mein nahi hai.' });
+  if (!ch) return res.status(404).json({ ok: false, error: 'Channel is not in this map.' });
   const data = Object.assign({ exportedAt: new Date().toISOString(), mapSeed: map.seedTitle, nicheKeywords: map.nicheKeywords }, channelBreakdown(ch));
   res.setHeader('Content-Type', 'application/json');
   res.setHeader('Content-Disposition', `attachment; filename="channelscope-${ch.title.replace(/[^\w\-]+/g, '_')}.json"`);
@@ -904,7 +1285,7 @@ app.get('/api/maps/:id/channels/:channelId/json', (req, res) => {
 // and only from channels whose median is ≥ 100 views — see channelBreakdown.
 app.get('/api/maps/:id/breakouts', (req, res) => {
   const { map } = findMap(req.params.id);
-  if (!map) return res.status(404).json({ ok: false, error: 'Map nahi mila.' });
+  if (!map) return res.status(404).json({ ok: false, error: 'Map not found.' });
   const min = parseFloat(req.query.min || '3') || 3;
   const rows = [];
   let excludedLowMedian = 0;
@@ -928,7 +1309,7 @@ app.get('/api/maps/:id/breakouts', (req, res) => {
 // ---------- topics (data-driven, no LLM key) ----------
 app.get('/api/maps/:id/topics', (req, res) => {
   const { map } = findMap(req.params.id);
-  if (!map) return res.status(404).json({ ok: false, error: 'Map nahi mila.' });
+  if (!map) return res.status(404).json({ ok: false, error: 'Map not found.' });
   const allVideos = map.channels.flatMap(c => c.videos.map(v => ({ ...v, channelMedian: c.medianViews, channelTitle: c.title })));
   const breakout = allVideos.filter(v => v.channelMedian && v.views >= v.channelMedian * 3);
   const clusters = new Map();
@@ -1101,7 +1482,7 @@ function buildAnalysis(map) {
 
   // 1. Seed channel analysis
   h += `<h3>Your channel so far</h3>`;
-  h += `<p><b>${escHtml(seed.title)}</b> is ${ageLabel(channelAgeDays(seed))} with ${fmt(seed.videoCount || vids.length)} videos (${vids.length} loaded here), ${fmt(seed.subs)} subscribers.</p>`;
+  h += `<p><b>${escHtml(seed.title)}</b> is ${ageLabel(channelAgeDays(seed))} with ${fmt(seed.videoCount || vids.length)} videos (${vids.length} loaded here), ${fmtSubs(seed.subs)} subscribers.</p>`;
   if (vids.length) {
     h += `<table class="an-table"><tr><th>Video</th><th>Duration</th><th>Views</th></tr>`;
     for (const v of vids) {
@@ -1127,7 +1508,7 @@ function buildAnalysis(map) {
         .map(v => ({ ...v, multiple: multOf(v, med) }))
         .sort((a, b) => b.multiple - a.multiple).slice(0, 4);
       const verdict = modelVerdict(c, map);
-      h += `<div class="an-channel"><b>${escHtml(c.title)}</b> — ${fmt(c.subs)} subs · ${ageLabel(channelAgeDays(c))} · ${verdict.good ? '✅ Good model' : '⚠️ Poor model'}<br><span class="muted">${escHtml(verdict.note)}</span>`;
+      h += `<div class="an-channel"><b>${escHtml(c.title)}</b> — ${fmtSubs(c.subs)} subs · ${ageLabel(channelAgeDays(c))} · ${verdict.good ? 'Good model' : 'Poor model'}<br><span class="muted">${escHtml(verdict.note)}</span>`;
       if (top.length) {
         h += `<ul>` + top.map(v => `<li><b>${fmt(v.views)}</b> (${v.multiple.toFixed(1)}×) — ${escHtml(v.title)}</li>`).join('') + `</ul>`;
       } else {
@@ -1156,13 +1537,13 @@ function buildAnalysis(map) {
 // ---------- map chat (keyword matching over own map data) ----------
 app.post('/api/maps/:id/chat', (req, res) => {
   const { map } = findMap(req.params.id);
-  if (!map) return res.status(404).json({ ok: false, error: 'Map nahi mila.' });
+  if (!map) return res.status(404).json({ ok: false, error: 'Map not found.' });
   const q = (req.body && req.body.question || '').trim();
-  if (!q) return res.status(400).json({ ok: false, error: 'Sawal likho.' });
+  if (!q) return res.status(400).json({ ok: false, error: 'Please type a question.' });
   // Makina-style analysis: structured report from stored map data (no LLM).
   if (isAnalysisIntent(q)) {
     const html = buildAnalysis(map);
-    if (!html) return res.status(400).json({ ok: false, error: 'Map mein channel data nahi hai.' });
+    if (!html) return res.status(400).json({ ok: false, error: 'No channel data in this map.' });
     return res.json({ ok: true, analysis: true, html, note: 'Analysis computed from your own map data — no AI key used.' });
   }
   const qtoks = tokenize(q);
@@ -1186,8 +1567,8 @@ app.post('/api/maps/:id/chat', (req, res) => {
   }
   vidHits.sort((a, b) => b.score - a.score || b.multiple - a.multiple);
   const answer = chanHits.length || vidHits.length
-    ? `Tumhare map ke data se (${map.channels.length} channels): "${q}" se mutabiq ${chanHits.length} channel(s) aur ${vidHits.length} video(s) mili hain — neeche breakout multiple ke hisaab se ranked hain.`
-    : `Tumhare map mein "${q}" se mutabiq kuch nahi mila. Map mein ${map.channels.length} channels hain — koi aur lafz try karo ya pehle map ko depth 2 tak bharo.`;
+    ? `From your map data (${map.channels.length} channels): "${q}" matched ${chanHits.length} channel(s) and ${vidHits.length} video(s) — ranked by breakout multiple below.`
+    : `Nothing in your map matched "${q}". Your map has ${map.channels.length} channels — try another word, or build the map to depth 2 first.`;
   res.json({ ok: true, answer, channels: chanHits, videos: vidHits.slice(0, 8), note: 'Answers come only from your own map data.' });
 });
 
@@ -1210,13 +1591,13 @@ app.post('/api/maps/:id/videos/:videoId/replicate', async (req, res) => {
   const settings = needKey(res);
   if (!settings) return;
   const { map } = findMap(req.params.id);
-  if (!map) return res.status(404).json({ ok: false, error: 'Map nahi mila.' });
+  if (!map) return res.status(404).json({ ok: false, error: 'Map not found.' });
   let video = null, owner = null;
   for (const c of map.channels) {
     const v = c.videos.find(v => v.id === req.params.videoId);
     if (v) { video = v; owner = c; break; }
   }
-  if (!video) return res.status(404).json({ ok: false, error: 'Video is map mein nahi hai.' });
+  if (!video) return res.status(404).json({ ok: false, error: 'Video is not in this map.' });
   try {
     // Fresh metadata from YouTube (description chapters + duration).
     let meta = null;
@@ -1274,7 +1655,7 @@ app.post('/api/maps/:id/videos/:videoId/replicate', async (req, res) => {
     lines.push(`*Generated by ChannelScope from public metadata (title, description${transcript ? ', transcript beats' : ''}, duration). Transcript, where used, was analysis material only — no source lines are reproduced.*`);
     res.json({ ok: true, script: lines.join('\n'), sourceTitle: video.title, sourceChannel: owner.title, durationSec, minutes, words });
   } catch (e) {
-    res.status(400).json({ ok: false, error: e.message || 'Script banate hue error aaya.' });
+    res.status(400).json({ ok: false, error: e.message || 'Failed to generate the script.' });
   }
 });
 
@@ -1287,7 +1668,7 @@ function getTrendingCache() { return loadJson(TRENDING_FILE, { runs: {} }).runs;
 function saveTrendingCache(runs) { saveJson(TRENDING_FILE, { runs }); }
 const TRENDING_MIN_MEDIAN = 100; // same guard as breakouts: no numeric outlier below this
 const TRENDING_SEARCH_KEYWORDS = 3; // searches cost 100 units each — bound the run
-const TRENDING_PAGE_NOTE = 'Criteria signal: 1000+ subs aur views lakhs mein (100,000+) — watch hours API se verify nahi ho sakte, is liye yehi signal use hota hai.';
+const TRENDING_PAGE_NOTE = 'Criteria signal: 1,000+ subscribers and 100,000+ views on the trending video — watch hours cannot be verified via the YouTube Data API, so this is the signal used.';
 
 async function runTrending(keywords, key, settings) {
   // Quota accounting for this run (search = 100 units, everything else = 1).
@@ -1296,22 +1677,36 @@ async function runTrending(keywords, key, settings) {
   const publishedAfter = new Date(Date.now() - 24 * 3600 * 1000).toISOString();
   // 1) Last-24h videos for the niche keywords (order=date → newest first).
   const searchJobs = keywords.slice(0, TRENDING_SEARCH_KEYWORDS).map(q => ({ q }));
+  let firstSearchError = null;
   const searchResults = await mapPool(searchJobs, async (job) => {
+    // Daily search cache: the same keyword's last-24h list is never paid for
+    // twice in one day (the trending result itself is cached daily per niche
+    // anyway, so a cached search is never stale within its useful life).
+    const cached = searchCacheGet('trend', job.q);
+    if (cached !== null) return cached;
     try {
+      chargeSearch(settings);
       const d = await yt('/search', { part: 'snippet', type: 'video', q: job.q, publishedAfter, order: 'date', maxResults: 25 }, key);
       addQuota(settings, ytCost('/search')); charge('/search');
-      return (d.items || []).map(it => ({
+      const vids = (d.items || []).map(it => ({
         id: (it.id || {}).videoId, title: it.snippet.title,
         channelId: it.snippet.channelId, channelTitle: it.snippet.channelTitle,
         publishedAt: it.snippet.publishedAt,
         thumbnail: (it.snippet.thumbnails && it.snippet.thumbnails.medium && it.snippet.thumbnails.medium.url) || ''
       })).filter(v => v.id);
-    } catch (e) { return []; } // one failed keyword must not kill the run
+      searchCacheSet('trend', job.q, vids);
+      return vids;
+    } catch (e) {
+      // Keep the FIRST search error — the run's caller reports it instead
+      // of silently returning an empty list (v1.3.0 swallowed it).
+      if (!firstSearchError) firstSearchError = { status: e.status || null, reason: e.reason || null, message: e.message || 'Search request failed', q: job.q };
+      return [];
+    }
   }, TRENDING_SEARCH_KEYWORDS);
   const byVideo = new Map();
   for (const list of searchResults) for (const v of list) if (!byVideo.has(v.id)) byVideo.set(v.id, v);
   const videos24h = [...byVideo.values()];
-  if (!videos24h.length) return { channels: [], quotaUsed: runQuota, searchedVideos: 0 };
+  if (!videos24h.length) return { channels: [], quotaUsed: runQuota, searchedVideos: 0, searchError: firstSearchError };
   // 2) View counts for the 24h videos (search results carry no statistics).
   const vChunks = [];
   for (let i = 0; i < videos24h.length; i += 50) vChunks.push(videos24h.slice(i, i + 50));
@@ -1345,8 +1740,9 @@ async function runTrending(keywords, key, settings) {
     const subs = +(st.subscriberCount || 0);
     const ageDays = sn.publishedAt ? Math.max(1, Math.round((Date.now() - new Date(sn.publishedAt).getTime()) / 86400000)) : 0;
     // Filter: channel 30–60 days old AND ≥ 1000 subscribers (monetization
-    // subs threshold, verified via API).
-    if (ageDays < 30 || ageDays > 60 || subs < 1000) continue;
+    // subs threshold, verified via API). A hidden/unknown subscriber count
+    // (subs === 0) cannot prove the threshold, so it does NOT pass.
+    if (ageDays < 30 || ageDays > 60 || !(subs >= 1000)) continue;
     const uploads = (item.contentDetails && item.contentDetails.relatedPlaylists && item.contentDetails.relatedPlaylists.uploads) || '';
     let recent = [];
     try { if (uploads) recent = await fetchChannelVideos(item.id, uploads, key, settings, 20); } catch (e) { /* ignore */ }
@@ -1378,12 +1774,13 @@ async function runTrending(keywords, key, settings) {
     });
   }
   out.sort((a, b) => (b.bestMultiple || -1) - (a.bestMultiple || -1) || b.bestViews - a.bestViews);
-  return { channels: out, quotaUsed: runQuota, searchedVideos: videos24h.length };
+  return { channels: out, quotaUsed: runQuota, searchedVideos: videos24h.length, searchError: firstSearchError };
 }
 
 app.get('/api/trending', async (req, res) => {
-  // Non-allowed users NEVER trigger a fresh scan (that would burn quota for
-  // data they cannot use) — they only get the cached run, server-side masked.
+  // Guests NEVER trigger a fresh scan — they only get the cached run,
+  // server-side masked. A fresh run needs login + 50 tokens (the allowlist
+  // does NOT gate it, but non-allowed users still only SEE masked data).
   const auth = getAuth(req);
   let keywords = [];
   let nicheLabel = '';
@@ -1393,37 +1790,64 @@ app.get('/api/trending', async (req, res) => {
     nicheLabel = typed;
   } else if (req.query.mapId) {
     const { map } = findMap(req.query.mapId);
-    if (!map) return res.status(404).json({ ok: false, error: 'Map nahi mila.' });
+    if (!map) return res.status(404).json({ ok: false, error: 'Map not found.' });
     keywords = (map.nicheKeywords || []).slice();
     nicheLabel = map.seedTitle + ' (map niche)';
   } else {
-    return res.status(400).json({ ok: false, error: 'Pehle map banao ya niche likho — trending kis niche ki dikhayein?' });
+    return res.status(400).json({ ok: false, error: 'Build a map first or type a niche — which niche should trending cover?' });
   }
-  if (!keywords.length) return res.status(400).json({ ok: false, error: 'Niche se koi usable keyword nahi nikla — koi aur niche likho.' });
+  if (!keywords.length) return res.status(400).json({ ok: false, error: 'No usable keyword came from this niche — please type a different niche.' });
   const cacheKey = [...keywords].sort().join(',');
   const today = todayStr();
   const runs = getTrendingCache();
   const hit = runs[cacheKey];
-  if (!auth.allowed) {
+  const canSee = auth.allowed;
+  const note = canSee ? TRENDING_PAGE_NOTE : ACCESS_NOTE;
+  if (!auth.loggedIn) {
     if (hit) {
       return res.json({ ok: true, allowed: false, cached: true, niche: nicheLabel, keywords, asOf: hit.asOf, quotaUsed: hit.quotaUsed, count: hit.channels.length, channels: hit.channels.map(maskTrendingChannel), note: ACCESS_NOTE });
     }
-    return res.json({ ok: true, allowed: false, cached: false, niche: nicheLabel, keywords, asOf: new Date().toISOString(), quotaUsed: 0, count: 0, channels: [], note: ACCESS_NOTE + ' Abhi is niche ka koi cached trending data nahi hai.' });
+    return res.json({ ok: true, allowed: false, cached: false, niche: nicheLabel, keywords, asOf: new Date().toISOString(), quotaUsed: 0, count: 0, channels: [], note: ACCESS_NOTE + ' No cached trending data for this niche yet.' });
+  }
+  if (hit && hit.date === today && req.query.refresh !== '1') {
+    return res.json({ ok: true, allowed: canSee, cached: true, niche: nicheLabel, keywords, asOf: hit.asOf, quotaUsed: hit.quotaUsed, count: hit.channels.length, channels: canSee ? hit.channels : hit.channels.map(maskTrendingChannel), note });
   }
   const settings = needKey(res);
   if (!settings) return;
-  if (hit && hit.date === today && req.query.refresh !== '1') {
-    return res.json({ ok: true, allowed: true, cached: true, niche: nicheLabel, keywords, asOf: hit.asOf, quotaUsed: hit.quotaUsed, count: hit.channels.length, channels: hit.channels, note: TRENDING_PAGE_NOTE });
-  }
   try {
+    // A FRESH trending run needs enough tokens (50) and enough shared quota.
+    const trendCost = TOKEN_COST.trending;
+    const trendTokenErr = checkTokens(auth.email, trendCost);
+    if (trendTokenErr) return res.status(402).json({ ok: false, error: trendTokenErr, needTokens: true, cost: trendCost });
+    const trendGuardErr = quotaGuardError(settings, estimateForTrending());
+    if (trendGuardErr) return res.status(503).json({ ok: false, error: trendGuardErr });
+    // Search guard: only the run's UNCACHED keyword searches count.
+    let trendNeeded = 0;
+    for (const q of keywords.slice(0, TRENDING_SEARCH_KEYWORDS)) { if (searchCacheGet('trend', q) === null) trendNeeded++; }
+    const trendSearchErr = searchGuardError(settings, trendNeeded);
+    if (trendSearchErr) return res.status(503).json({ ok: false, error: trendSearchErr });
     const run = await runTrending(keywords, settings.apiKey, settings);
+    // If the run found nothing AND the searches themselves failed, say so
+    // with the real YouTube reason — an empty list must not hide the error.
+    if (!run.channels.length && run.searchError) {
+      return res.status(400).json({
+        ok: false,
+        error: `YouTube search failed (${run.searchError.status || ''} ${run.searchError.reason || ''}): ${run.searchError.message}${quotaExceededHint(run.searchError)}`,
+        yt: run.searchError,
+        quotaUsed: run.quotaUsed
+      });
+    }
+    // Charge after the run succeeded; if the charge fails, do not cache the
+    // run (the user keeps their tokens and can retry).
+    const spent = spendTokens(auth.email, trendCost);
+    if (!spent.ok) return res.status(402).json({ ok: false, error: spent.error, needTokens: true, cost: trendCost });
     const record = { niche: nicheLabel, keywords, language: detectLangFamily(keywords.join(' ')), date: today, asOf: new Date().toISOString(), quotaUsed: run.quotaUsed, channels: run.channels };
     runs[cacheKey] = record;
     saveTrendingCache(runs);
     flushSettings(settings);
-    res.json({ ok: true, allowed: true, cached: false, niche: nicheLabel, keywords, asOf: record.asOf, quotaUsed: run.quotaUsed, count: run.channels.length, channels: run.channels, note: TRENDING_PAGE_NOTE });
+    res.json({ ok: true, allowed: canSee, cached: false, niche: nicheLabel, keywords, asOf: record.asOf, quotaUsed: run.quotaUsed, count: run.channels.length, channels: canSee ? run.channels : run.channels.map(maskTrendingChannel), note, tokens: { balance: spent.balance, spent: trendCost } });
   } catch (e) {
-    res.status(400).json({ ok: false, error: e.message || 'Trending nikaalte hue error aaya.' });
+    res.status(400).json({ ok: false, error: e.message || 'Failed to load trending data.' });
   }
 });
 
@@ -1455,11 +1879,11 @@ app.get('/api/auth/me', (req, res) => {
 app.post('/api/auth/setup', (req, res) => {
   // First-run admin creation — only works while ZERO users exist.
   const store = getUsers();
-  if (store.users.length > 0) return res.status(403).json({ ok: false, error: 'Admin pehle se bana hua hai.' });
+  if (store.users.length > 0) return res.status(403).json({ ok: false, error: 'An admin account already exists.' });
   const email = normEmail(req.body && req.body.email);
   const password = String((req.body && req.body.password) || '');
-  if (!validEmail(email)) return res.status(400).json({ ok: false, error: 'Sahi email likho.' });
-  if (password.length < 8) return res.status(400).json({ ok: false, error: 'Password kam se kam 8 characters ka ho.' });
+  if (!validEmail(email)) return res.status(400).json({ ok: false, error: 'Please enter a valid email address.' });
+  if (password.length < 8) return res.status(400).json({ ok: false, error: 'Password must be at least 8 characters.' });
   store.users.push({ email, password: hashPassword(password), role: 'admin', createdAt: new Date().toISOString() });
   saveUsers(store);
   setSessionCookie(res, email);
@@ -1468,10 +1892,10 @@ app.post('/api/auth/setup', (req, res) => {
 app.post('/api/auth/register', (req, res) => {
   const email = normEmail(req.body && req.body.email);
   const password = String((req.body && req.body.password) || '');
-  if (!validEmail(email)) return res.status(400).json({ ok: false, error: 'Sahi email likho.' });
-  if (password.length < 8) return res.status(400).json({ ok: false, error: 'Password kam se kam 8 characters ka ho.' });
+  if (!validEmail(email)) return res.status(400).json({ ok: false, error: 'Please enter a valid email address.' });
+  if (password.length < 8) return res.status(400).json({ ok: false, error: 'Password must be at least 8 characters.' });
   const store = getUsers();
-  if (store.users.some(u => u.email === email)) return res.status(409).json({ ok: false, error: 'Is email par account pehle se hai — login karo.' });
+  if (store.users.some(u => u.email === email)) return res.status(409).json({ ok: false, error: 'An account with this email already exists — please log in.' });
   store.users.push({ email, password: hashPassword(password), role: 'user', createdAt: new Date().toISOString() });
   saveUsers(store);
   setSessionCookie(res, email);
@@ -1482,14 +1906,14 @@ app.post('/api/auth/login', (req, res) => {
   const password = String((req.body && req.body.password) || '');
   const store = getUsers();
   const user = store.users.find(u => u.email === email);
-  if (!user || !verifyPassword(password, user.password)) return res.status(401).json({ ok: false, error: 'Email ya password ghalat hai.' });
+  if (!user || !verifyPassword(password, user.password)) return res.status(401).json({ ok: false, error: 'Email or password is incorrect.' });
   setSessionCookie(res, email);
   res.json({ ok: true, email, role: user.role, allowed: user.role === 'admin' || store.allowlist.includes(email) });
 });
 app.post('/api/auth/logout', (req, res) => { clearSessionCookie(res); res.json({ ok: true }); });
 function requireAdmin(req, res) {
   const auth = getAuth(req);
-  if (!auth.loggedIn || auth.role !== 'admin') { res.status(403).json({ ok: false, error: 'Sirf admin ye kar sakta hai.' }); return null; }
+  if (!auth.loggedIn || auth.role !== 'admin') { res.status(403).json({ ok: false, error: 'Only an admin can do this.' }); return null; }
   return auth;
 }
 app.get('/api/auth/admin/allowlist', (req, res) => {
@@ -1499,7 +1923,7 @@ app.get('/api/auth/admin/allowlist', (req, res) => {
 app.post('/api/auth/admin/allowlist', (req, res) => {
   if (!requireAdmin(req, res)) return;
   const email = normEmail(req.body && req.body.email);
-  if (!validEmail(email)) return res.status(400).json({ ok: false, error: 'Sahi email likho.' });
+  if (!validEmail(email)) return res.status(400).json({ ok: false, error: 'Please enter a valid email address.' });
   const store = getUsers();
   if (!store.allowlist.includes(email)) { store.allowlist.push(email); saveUsers(store); }
   res.json({ ok: true, allowlist: store.allowlist });
@@ -1511,6 +1935,198 @@ app.delete('/api/auth/admin/allowlist/:email', (req, res) => {
   store.allowlist = store.allowlist.filter(e => e !== email);
   saveUsers(store);
   res.json({ ok: true, allowlist: store.allowlist });
+});
+
+// Admin: token management — list users with plan + balance, grant paid
+// tokens manually (support / goodwill), and assign a plan manually (e.g.
+// give the site owner a Pro plan without going through Stripe).
+app.get('/api/auth/admin/users', (req, res) => {
+  if (!requireAdmin(req, res)) return;
+  const store = getUsers();
+  const today = todayStr();
+  res.json({
+    ok: true,
+    users: store.users.map(u => ({
+      email: u.email, role: u.role, createdAt: u.createdAt || null,
+      ...tokenStateFor(u, today),
+      stripeCustomerId: u.stripeCustomerId || null,
+      stripeSubscriptionId: u.stripeSubscriptionId || null
+    }))
+  });
+});
+app.post('/api/auth/admin/grant', (req, res) => {
+  if (!requireAdmin(req, res)) return;
+  const email = normEmail(req.body && req.body.email);
+  const amount = Math.floor(+((req.body && req.body.tokens) || 0));
+  if (!validEmail(email)) return res.status(400).json({ ok: false, error: 'Please enter a valid email address.' });
+  if (!(amount > 0)) return res.status(400).json({ ok: false, error: 'Enter a token amount greater than 0.' });
+  const store = getUsers();
+  const user = store.users.find(u => u.email === email);
+  if (!user) return res.status(404).json({ ok: false, error: 'User not found.' });
+  user.paidTokens = (user.paidTokens || 0) + amount;
+  saveUsers(store);
+  res.json({ ok: true, email, paidTokens: user.paidTokens });
+});
+app.post('/api/auth/admin/set-plan', (req, res) => {
+  if (!requireAdmin(req, res)) return;
+  const email = normEmail(req.body && req.body.email);
+  const planId = String((req.body && req.body.plan) || '');
+  if (!validEmail(email)) return res.status(400).json({ ok: false, error: 'Please enter a valid email address.' });
+  const store = getUsers();
+  const user = store.users.find(u => u.email === email);
+  if (!user) return res.status(404).json({ ok: false, error: 'User not found.' });
+  if (planId === 'free') {
+    user.plan = 'free'; user.paidTokens = 0; user.periodEnd = null; user.stripeSubscriptionId = null;
+  } else {
+    const plan = PLANS[planId];
+    if (!plan) return res.status(400).json({ ok: false, error: 'Unknown plan.' });
+    user.plan = planId;
+    user.paidTokens = plan.tokens;
+    user.periodEnd = new Date(Date.now() + 30 * 86400 * 1000).toISOString();
+  }
+  saveUsers(store);
+  res.json({ ok: true, email, plan: user.plan || 'free' });
+});
+
+// ---------- billing: tokens + Stripe subscriptions ----------
+// Plans: Free (100 tokens/day, no payment), Starter $2/mo = 1,500 tokens/mo,
+// Pro $5/mo = 5,000 tokens/mo. Stripe keys come ONLY from env vars —
+// STRIPE_SECRET_KEY, STRIPE_PUBLISHABLE_KEY, STRIPE_WEBHOOK_SECRET,
+// STRIPE_PRICE_1500, STRIPE_PRICE_5000. Nothing Stripe is hardcoded.
+// If the keys are not set, paymentsEnabled is false and the Pricing page
+// says "Payments coming soon" instead of showing a fake checkout button.
+// Stripe prices are created in the Stripe dashboard (see README): two
+// recurring monthly prices, one per paid plan; their IDs go in the env vars.
+let stripeClient = null;
+function getStripe() {
+  const key = process.env.STRIPE_SECRET_KEY;
+  if (!key) return null;
+  if (!stripeClient) {
+    try { stripeClient = require('stripe')(key); }
+    catch (e) { console.error('Stripe SDK could not be loaded:', e.message); return null; }
+  }
+  return stripeClient;
+}
+function stripeEnabled() {
+  return !!(process.env.STRIPE_SECRET_KEY && process.env.STRIPE_PUBLISHABLE_KEY);
+}
+function findUserByStripeSub(store, subId) {
+  if (!subId) return null;
+  return store.users.find(u => u.stripeSubscriptionId === subId) || null;
+}
+function planIdForPriceId(priceId) {
+  if (priceId === process.env.STRIPE_PRICE_1500) return 'starter';
+  if (priceId === process.env.STRIPE_PRICE_5000) return 'pro';
+  return null;
+}
+// Apply a Stripe subscription to a user: plan + monthly token grant +
+// period end. Called from the webhook (never from the browser).
+function applySubscriptionToUser(store, user, planId, sub) {
+  const plan = PLANS[planId];
+  if (!plan) return false;
+  user.plan = planId;
+  user.paidTokens = plan.tokens; // fresh monthly grant (does not roll over)
+  user.periodEnd = sub && sub.current_period_end
+    ? new Date(sub.current_period_end * 1000).toISOString() : null;
+  if (sub) {
+    user.stripeSubscriptionId = sub.id;
+    if (sub.customer) user.stripeCustomerId = typeof sub.customer === 'string' ? sub.customer : sub.customer.id;
+  }
+  return true;
+}
+async function handleStripeEvent(event) {
+  const stripe = getStripe();
+  if (!stripe) return;
+  const obj = event.data.object;
+  if (event.type === 'checkout.session.completed') {
+    const email = normEmail((obj.metadata && obj.metadata.email) || obj.customer_email || (obj.customer_details && obj.customer_details.email));
+    const planId = (obj.metadata && obj.metadata.plan) || null;
+    if (!email || !planId || !PLANS[planId]) { console.error('Stripe checkout completed with missing email/plan:', event.id); return; }
+    const store = getUsers();
+    const user = store.users.find(u => u.email === email);
+    if (!user) { console.error('Stripe checkout for unknown user:', email); return; }
+    let sub = null;
+    if (obj.subscription) { try { sub = await stripe.subscriptions.retrieve(obj.subscription); } catch (e) { console.error('Could not retrieve subscription:', e.message); } }
+    if (applySubscriptionToUser(store, user, planId, sub)) {
+      if (obj.customer) user.stripeCustomerId = typeof obj.customer === 'string' ? obj.customer : obj.customer.id;
+      saveUsers(store);
+      console.log(`Stripe: granted ${planId} plan to ${email}`);
+    }
+  } else if (event.type === 'invoice.paid') {
+    // Renewals only — the first invoice (subscription_create) is already
+    // covered by checkout.session.completed; granting again would double it.
+    if (obj.billing_reason !== 'subscription_cycle' || !obj.subscription) return;
+    let sub = null;
+    try { sub = await stripe.subscriptions.retrieve(obj.subscription); } catch (e) { console.error('Could not retrieve subscription:', e.message); return; }
+    const priceId = sub.items && sub.items.data && sub.items.data[0] && sub.items.data[0].price && sub.items.data[0].price.id;
+    const planId = planIdForPriceId(priceId);
+    if (!planId) return;
+    const store = getUsers();
+    const user = findUserByStripeSub(store, sub.id);
+    if (!user) return;
+    if (applySubscriptionToUser(store, user, planId, sub)) {
+      saveUsers(store);
+      console.log(`Stripe: renewed ${planId} tokens for ${user.email}`);
+    }
+  } else if (event.type === 'customer.subscription.deleted') {
+    const store = getUsers();
+    const user = findUserByStripeSub(store, obj.id);
+    if (!user) return;
+    user.plan = 'free'; user.paidTokens = 0; user.periodEnd = null; user.stripeSubscriptionId = null;
+    saveUsers(store);
+    console.log(`Stripe: subscription ended for ${user.email} — back to Free`);
+  } else if (event.type === 'customer.subscription.updated') {
+    if (obj.status !== 'canceled' && obj.status !== 'incomplete_expired') return;
+    const store = getUsers();
+    const user = findUserByStripeSub(store, obj.id);
+    if (!user) return;
+    user.plan = 'free'; user.paidTokens = 0; user.periodEnd = null; user.stripeSubscriptionId = null;
+    saveUsers(store);
+    console.log(`Stripe: subscription ${obj.status} for ${user.email} — back to Free`);
+  }
+}
+
+app.get('/api/billing/config', (req, res) => {
+  res.json({
+    ok: true,
+    paymentsEnabled: stripeEnabled(),
+    publishableKey: stripeEnabled() ? process.env.STRIPE_PUBLISHABLE_KEY : null,
+    freeDailyTokens: FREE_DAILY_TOKENS,
+    plans: Object.values(PLANS).map(p => ({ id: p.id, name: p.name, price: p.price, tokens: p.tokens }))
+  });
+});
+app.get('/api/billing/me', (req, res) => {
+  const auth = getAuth(req);
+  if (!auth.loggedIn) return res.json({ ok: true, loggedIn: false });
+  const st = tokenState(auth.email);
+  res.json({ ok: true, loggedIn: true, email: auth.email, ...st });
+});
+app.post('/api/billing/checkout', async (req, res) => {
+  const auth = requireLogin(req, res);
+  if (!auth) return;
+  const plan = PLANS[String((req.body && req.body.plan) || '').trim()];
+  if (!plan) return res.status(400).json({ ok: false, error: 'Unknown plan.' });
+  const stripe = getStripe();
+  const priceId = process.env[plan.priceEnv];
+  if (!stripe || !priceId) return res.status(503).json({ ok: false, error: 'Payments are coming soon — plans will be available once configured.' });
+  try {
+    const host = req.get('host') || '';
+    const base = host.includes('localhost') || host.includes('127.0.0.1') ? 'http://' + host : 'https://' + host;
+    const session = await stripe.checkout.sessions.create({
+      mode: 'subscription',
+      customer_email: auth.email,
+      client_reference_id: auth.email,
+      metadata: { email: auth.email, plan: plan.id },
+      line_items: [{ price: priceId, quantity: 1 }],
+      success_url: base + '/pricing.html?checkout=success',
+      cancel_url: base + '/pricing.html?checkout=cancelled',
+      allow_promotion_codes: true
+    });
+    res.json({ ok: true, url: session.url });
+  } catch (e) {
+    console.error('Stripe checkout failed:', e.message);
+    res.status(400).json({ ok: false, error: 'Could not start checkout — please try again later.' });
+  }
 });
 
 // ---------- Overview: aggregates over OUR stored data only (maps + trending scans) ----------
@@ -1529,7 +2145,10 @@ function buildChannelIndex() {
   };
   for (const m of getMaps()) {
     for (const c of (m.channels || [])) {
-      const e = idx.get(c.id) || { id: c.id, title: c.title || '', thumbnail: c.thumbnail || '', subs: c.subs || 0, publishedAt: c.publishedAt || '', medianViews: c.medianViews || 0, videos: [] };
+      // subs: keep null when unknown (hidden/absent) — never coerce to 0.
+      const subs = (typeof c.subs === 'number' && c.subs > 0) ? c.subs : null;
+      const e = idx.get(c.id) || { id: c.id, title: c.title || '', thumbnail: c.thumbnail || '', subs, publishedAt: c.publishedAt || '', medianViews: c.medianViews || 0, videos: [] };
+      if (e.subs == null && subs != null) e.subs = subs;
       if (!e.medianViews && c.medianViews) e.medianViews = c.medianViews;
       for (const v of (c.videos || [])) addVideo(e, v);
       idx.set(c.id, e);
@@ -1538,7 +2157,9 @@ function buildChannelIndex() {
   for (const run of Object.values(getTrendingCache())) {
     for (const c of (run.channels || [])) {
       const cid = c.channelId || c.id;
-      const e = idx.get(cid) || { id: cid, title: c.title || '', thumbnail: c.thumbnail || '', subs: c.subs || 0, publishedAt: c.channelPublishedAt || '', medianViews: c.medianViews || 0, videos: [] };
+      const subs = (typeof c.subs === 'number' && c.subs > 0) ? c.subs : null;
+      const e = idx.get(cid) || { id: cid, title: c.title || '', thumbnail: c.thumbnail || '', subs, publishedAt: c.channelPublishedAt || '', medianViews: c.medianViews || 0, videos: [] };
+      if (e.subs == null && subs != null) e.subs = subs;
       if (!e.medianViews && c.medianViews) e.medianViews = c.medianViews;
       for (const v of (c.videos || [])) addVideo(e, v);
       idx.set(cid, e);
@@ -1598,7 +2219,7 @@ app.get('/api/overview', (req, res) => {
     for (const c of (run.channels || [])) {
       recent.push({
         id: c.channelId || c.id, title: c.title || '', thumbnail: c.thumbnail || '',
-        subs: c.subs || 0, ageDays: c.ageDays || null, medianViews: c.medianViews || 0,
+        subs: (typeof c.subs === 'number' && c.subs > 0) ? c.subs : null, ageDays: c.ageDays || null, medianViews: c.medianViews || 0,
         bestMultiple: c.bestMultiple == null ? null : c.bestMultiple, bestViews: c.bestViews || 0,
         language: run.language || 'unknown', niche: run.niche || ''
       });
@@ -1620,11 +2241,15 @@ app.get('/api/overview', (req, res) => {
     });
   }
   competition.sort((a, b) => b.bestMultiple - a.bestMultiple || b.bestViews - a.bestViews);
-  // Viral Videos On Small Channels: subs < 100,000, published in the viral window.
+  // Viral Videos On Small Channels: subs < 100,000 AND views ≥ 100,000
+  // (the lakhs floor — a 108-view video is never "viral"). A channel with
+  // an unknown subscriber count (hidden subs → null) is not excluded: its
+  // smallness cannot be disproven, and the views floor already filters junk.
   const viral = [];
   for (const e of idx.values()) {
-    if ((e.subs || 0) >= 100000) continue;
+    if (e.subs != null && e.subs >= 100000) continue;
     for (const v of e.videos) {
+      if ((v.views || 0) < 100000) continue;
       const t = new Date(v.publishedAt).getTime();
       if (!t || now - t > viralMs) continue;
       viral.push({ ...v, vph: vphOf(v) });
@@ -1642,7 +2267,7 @@ app.get('/api/overview', (req, res) => {
     competition: (allowed ? competition : competition.map(maskChannelRow)).slice(0, 20),
     viralVideos: (allowed ? viral : viral.map(maskVideoCard)).slice(0, 24),
     windows: { window, viralWindow },
-    note: 'Ye saara data hamare apne maps aur trending scans se hai — koi fake number nahi. Avg views = stored videos ki average.'
+    note: 'All data comes from our own maps and trending scans — no made-up numbers. Avg views = average of stored videos.'
   });
 });
 
