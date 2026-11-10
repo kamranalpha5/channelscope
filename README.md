@@ -2,7 +2,7 @@
 
 makina.studio-style tool, apni branding ke saath. Apne PC par chalao, apni YouTube Data API v3 key se.
 
-**Version 1.3.1** — token system + Stripe plans, pure-English UI, separate admin panel (`/admin`), single-key model, search error surfacing, 0-subs fix, viral floor (≥100K views), clickable YouTube cards, daily search cache (100/day search quota), search-quota guard + display, public Privacy Policy (`/privacy`).
+**Version 1.3.2** — refund on failed/stalled builds, real-quota search guard (a search `quotaExceeded` today blocks new builds before charging), admin token exemption (admins never pay tokens — header chip reads "Admin · Unlimited"), full design polish (shared design system, skeletons, SVG icons, no emoji-as-icons), public Terms of Service (`/terms`). Also in 1.3.1: token system + Stripe plans, pure-English UI, separate admin panel (`/admin`), single-key model, search error surfacing, 0-subs fix, viral floor (≥100K views), clickable YouTube cards, daily search cache (100/day search quota), search-quota guard + display, public Privacy Policy (`/privacy`).
 
 ## Overview page (home page — `/`)
 
@@ -12,7 +12,7 @@ Site ka home page ab **Overview** hai (Map app `/app.html` par hai). Nexlev-styl
 - **Total Channels Analyzed:** HAMARA asal count — hamare maps + trending scans ke unique channels (aaj ka increment saath). Koi bahari number nahi.
 - **Recently Added Outlier Channels (Last 24 Hours):** pichle 24h ke trending scans se naye channels — DP, naam, subs, outlier multiple bar ke saath. Language filter bhi hai.
 - **Niches with High Future Competition:** time tabs (Last 24 Hours / 7 Days / 30 Days / 90 Days) — DP, naam, subs, Avg views (stored videos ki average), Videos, Days since start, Outlier. Jis period ke liye data nahi, wahan "no data yet" dikhta hai — fake numbers kabhi nahi.
-- **Viral Videos On Small Channels:** Last 24 Hours / 7 Days / 30 Days dropdown + 🎲 Random button. Video cards: thumbnail + duration, title, channel DP + naam, views + kitne din pehle, **VPH (views per hour)** + subs. Small channels = subs &lt; 100,000. Cards views ke hisaab se sorted; Random grid ko shuffle karta hai (koi API call nahi). VPH = views ÷ publish hone se ab tak ke hours (publishedAt + viewCount se, koi extra API nahi).
+- **Viral Videos On Small Channels:** Last 24 Hours / 7 Days / 30 Days dropdown + Random button (shuffle icon). Video cards: thumbnail + duration, title, channel DP + naam, views + kitne din pehle, **VPH (views per hour)** + subs. Small channels = subs &lt; 100,000. Cards views ke hisaab se sorted; Random grid ko shuffle karta hai (koi API call nahi). VPH = views ÷ publish hone se ab tak ke hours (publishedAt + viewCount se, koi extra API nahi).
 
 ## Login + access control (Overview / Trending data)
 
@@ -71,14 +71,24 @@ Site ka home page ab **Overview** hai (Map app `/app.html` par hai). Nexlev-styl
   - Trending run ke keywords bhi cache hote hain.
   - Per-build searches: Depth 1 ≈ 13, Depth 2 ≈ 13 (pehle ~25), Depth 4 ≈ 13 (pehle ~37) — sirf pehli ring ki queries kharch hoti hain, baaqi rings cache se chalti hain. Naya niche = 12 searches; wohi niche dobara = 0.
 - **Search guard:** build/trending shuru karne se pehle server check karta hai ke baaqi searches kaafi hain (sirf UNCACHED queries gini jati hain). Agar nahi to build shuru hi nahi hota aur saaf message dikhta hai — tokens bhi charge nahi hote.
+- **Real-quota block (v1.3.2):** local `searchUsed` counter fresh deploy par 0 se shuru hota hai jabke Google ka asal usage pehle se over ho sakta hai — is liye jab YouTube kisi search par 429 `quotaExceeded` de, wo baat din bhar ke liye yaad rakhi jati hai (`data/search-blocked.json`, restart se bhi mehfooz). Uske baad naya build/trending charge hone se pehle block hota hai: "YouTube's daily search limit is exhausted — please try again tomorrow. Your tokens were not charged." Block tab khatam hota hai jab din badle, koi search dobara kamyab ho, ya admin nayi API key save kare. Cached searches (0 nayi searches) wale builds phir bhi chalte hain. `/api/status` aur `/api/diag` mein `searchBlocked` field bhi aata hai.
 - **Display:** Map page ki quota bar mein "Search calls used today: X / 100" dikhta hai; `/api/status` aur `/api/diag` mein bhi `searchUsed` / `searchLimit` aate hain.
 - **Search quota increase:** unit quota se alag mangwana hota hai — YouTube Audit and Quota Extension Form bharna hota hai (Console se increase refuse ho jata hai: "Not enough usage history"). Form ke liye Privacy Policy URL chahiye — neeche dekho.
+
+## Refunds — failed/stalled builds (v1.3.2)
+
+- **Rule:** jo build charge hone ke baad fail ya stall ho jaye, uske tokens **poore wapas** milte hain — expand stall (search fail, zero neighbours, no niche keywords), search guard se block hone wala retry, create/trending mein charge ke baad ki failure — sab. Har map par `paidBy` / `paidFree` / `paidPaid` / `refunded` likha hota hai; `refunded` flag aik dafa se zyada refund nahi hone deta. Searches waise bhi din bhar cache rehti hain, to retry taqreeban muft hota hai.
 
 ## Privacy Policy (`/privacy`)
 
 - Site par public **Privacy Policy** page hai: `https://channelscope.onrender.com/privacy` — login/allowlist se azad, pure English. Link footer + login modals + sidebar foot mein hai.
 - Is mein hai: kya data collect hota hai (email + hashed password, usage/tokens, YouTube public data, session cookie), Stripe payments, kya kabhi nahi hota (data bechna/share karna, ads, tracking), deletion (contact email), aur YouTube API Services ka required disclosure (YouTube Terms + Google Privacy Policy links).
 - Contact email policy mein: **kamranalpha5@gmail.com** (project owner ka account — badalna ho to `public/privacy.html` mein aik jagah badlo).
+
+## Terms of Service (`/terms`) (v1.3.2)
+
+- Site par public **Terms of Service** page hai: `https://channelscope.onrender.com/terms` — login/allowlist se azad, pure English, Privacy Policy jaisi design. Link wahi jagah hai jahan Privacy Policy ka link hai (footer, sidebar foot, login modals).
+- Is mein hai: service ki description, accounts, tokens/payments (Stripe), acceptable use, YouTube data + intellectual property, liability, changes, contact (kamranalpha5@gmail.com). Audit form ki "Terms of Service Documentation" evidence ke liye yehi page use hota hai.
 
 ## Tokens + Pricing (v1.3.1)
 
@@ -89,6 +99,7 @@ Token site ki apni currency hai — har logged-in user ke paas token balance hot
 - **Paid plans (Stripe, monthly):** **Starter $2/month = 1,500 tokens/month; Pro $5/month = 5,000 tokens/month.** Tokens har billing period mein refresh hote hain (unused paid tokens roll over nahi hote). Free 100/day paid plan ke saath bhi milte rehte hain.
 - **Pricing page:** Nav mein "Pricing" — dono plans ke cards, current plan highlight, Buy/Upgrade Plan buttons. Logged-out user ko pehle login karna hota hai. Admin apne plan ko admin panel se bhi set kar sakta hai (bina Stripe ke) ya tokens grant kar sakta hai.
 - **Allowlist ka kaam:** sirf Overview data ka blur/unblur. Building ke liye login + tokens chahiye — allowlist zaroori nahi.
+- **Admin exemption (v1.3.2):** admin accounts ko tokens kabhi charge nahi hote — site owner khud ko pay nahi karta (purane build-count system mein bhi admin exempt tha; token system mein ye ghalti se nikal gaya tha). Admin ka balance `unlimited` hota hai aur header chip mein "Admin · Unlimited" dikhta hai. Shared YouTube quota guard admin par bhi lagta hai. Admin panel se grant tokens / set plan non-admin users ke liye waise hi kaam karta hai.
 
 ### Stripe setup (payments ke liye zaroori)
 

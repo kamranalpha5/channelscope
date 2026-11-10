@@ -52,7 +52,8 @@ app.post('/api/billing/webhook', express.raw({ type: 'application/json' }), asyn
 // YouTube Audit and Quota Extension Form: https://<host>/privacy
 app.get('/privacy', (req, res) => res.sendFile(path.join(__dirname, 'public', 'privacy.html')));
 app.get('/pricing', (req, res) => res.sendFile(path.join(__dirname, 'public', 'pricing.html')));
-
+// Terms of Service — public page (v1.3.2), linked from the same footers as /privacy.
+app.get('/terms', (req, res) => res.sendFile(path.join(__dirname, 'public', 'terms.html')));
 
 app.use(express.json({ limit: '1mb' }));
 app.use(express.static(path.join(__dirname, 'public')));
@@ -204,7 +205,12 @@ function searchRemaining(settings) {
 }
 // Fail fast before starting work the search quota cannot cover, so the user
 // never pays tokens for a build that is doomed to stall on search.
+const SEARCH_BLOCKED_MSG = 'YouTube\'s daily search limit is exhausted — please try again tomorrow. Your tokens were not charged.';
 function searchGuardError(settings, needed) {
+  // Real-quota block (v1.3.2): if YouTube already answered a search with
+  // quotaExceeded today, block before charging. A build whose searches are
+  // all cached (needed === 0) still runs — it needs no new search.
+  if (needed > 0 && isSearchBlockedToday()) return SEARCH_BLOCKED_MSG;
   const left = searchRemaining(settings);
   if (left < needed) {
     return `Daily search quota is exhausted — only ${left} of ${SEARCH_LIMIT} search calls remain today. Please try again tomorrow.`;
@@ -253,6 +259,29 @@ function saveSettingsSoon(s) {
   if (settingsSaveTimer) return;
   settingsSaveTimer = setTimeout(() => { settingsSaveTimer = null; try { saveSettings(s); } catch (e) { /* ignore */ } }, 400);
 }
+// ---------- real search-quota block (v1.3.2) ----------
+// YouTube's real "Search Queries per day" usage is NOT visible locally:
+// the local searchUsed counter restarts at 0 after every fresh deploy,
+// while Google's counter may already be over 100. So once YouTube answers
+// a search with 429 quotaExceeded, that fact is remembered for the rest of
+// the day — persisted to disk (data/search-blocked.json) so it survives
+// restarts. The block clears when the date changes, when a later search
+// succeeds, or when the admin saves a new API key.
+const SEARCH_BLOCKED_FILE = path.join(DATA_DIR, 'search-blocked.json');
+function searchBlockedDate() {
+  const b = loadJson(SEARCH_BLOCKED_FILE, { date: '' });
+  return b.date || '';
+}
+function isSearchBlockedToday() { return searchBlockedDate() === todayStr(); }
+function markSearchBlocked() {
+  if (searchBlockedDate() === todayStr()) return;
+  saveJson(SEARCH_BLOCKED_FILE, { date: todayStr() });
+}
+function clearSearchBlocked() {
+  if (!searchBlockedDate()) return;
+  saveJson(SEARCH_BLOCKED_FILE, { date: '' });
+}
+
 // ---------- tokens + quota protection ----------
 // TOKEN MODEL (v1.3.1): tokens are the site's own currency. Every logged-in
 // user gets 100 free tokens per day (refreshes every 24h, never accumulates).
@@ -276,6 +305,19 @@ const TOKEN_COST = { 1: 50, 2: 100, 4: 200, trending: 50 };
 // paidTokens, freeUsed, freeDate, periodEnd, stripeCustomerId,
 // stripeSubscriptionId.
 function tokenStateFor(user, today) {
+  // ADMIN EXEMPTION (v1.3.2): the site owner never pays tokens — the old
+  // build-count system exempted the admin and the token system dropped it
+  // by accident. Admins have unlimited tokens. The shared YouTube quota
+  // guard still applies to them (it is checked separately, not here), and
+  // the admin panel's grant/set-plan still works for non-admin users.
+  if (user.role === 'admin') {
+    return {
+      plan: 'admin', planName: 'Admin',
+      freeAllowance: FREE_DAILY_TOKENS, freeUsed: 0, freeLeft: FREE_DAILY_TOKENS,
+      paidTokens: 0, balance: null, unlimited: true,
+      periodEnd: null
+    };
+  }
   const freeUsed = (user.freeDate === today) ? (user.freeUsed || 0) : 0;
   const freeLeft = Math.max(0, FREE_DAILY_TOKENS - freeUsed);
   const paidTokens = user.paidTokens || 0;
@@ -283,7 +325,7 @@ function tokenStateFor(user, today) {
   return {
     plan: user.plan || 'free', planName: plan ? plan.name : 'Free',
     freeAllowance: FREE_DAILY_TOKENS, freeUsed, freeLeft,
-    paidTokens, balance: freeLeft + paidTokens,
+    paidTokens, balance: freeLeft + paidTokens, unlimited: false,
     periodEnd: user.periodEnd || null
   };
 }
@@ -296,17 +338,20 @@ function tokenState(email) {
 function checkTokens(email, amount) {
   const st = tokenState(email);
   if (!st) return 'Please log in to continue.';
+  if (st.unlimited) return null; // admins are never charged
   if (st.balance < amount) {
     return `Not enough tokens — this costs ${amount} tokens and your balance is ${st.balance}. Your free allowance of ${FREE_DAILY_TOKENS} tokens refreshes tomorrow, or upgrade your plan for more.`;
   }
   return null;
 }
 // Spend tokens: free daily allowance first (it expires), then paid tokens.
-// Returns {ok, balance, freeTaken, paidTaken} or {ok:false, error}.
+// Returns {ok, balance, freeTaken, paidTaken, spent} or {ok:false, error}.
 function spendTokens(email, amount) {
   const store = getUsers();
   const user = store.users.find(u => u.email === normEmail(email));
   if (!user) return { ok: false, error: 'Please log in to continue.' };
+  // Admins are never charged (v1.3.2) — no freeUsed/paidTokens is recorded.
+  if (user.role === 'admin') return { ok: true, balance: null, freeTaken: 0, paidTaken: 0, spent: 0, unlimited: true };
   const today = todayStr();
   const st = tokenStateFor(user, today);
   if (st.balance < amount) return { ok: false, error: `Not enough tokens — this costs ${amount} tokens and your balance is ${st.balance}.`, balance: st.balance };
@@ -318,7 +363,7 @@ function spendTokens(email, amount) {
   const paidTaken = remaining;
   if (paidTaken > 0) user.paidTokens = (user.paidTokens || 0) - paidTaken;
   saveUsers(store);
-  return { ok: true, balance: st.balance - amount, freeTaken, paidTaken };
+  return { ok: true, balance: st.balance - amount, freeTaken, paidTaken, spent: amount };
 }
 // Reverse a spend (e.g. a build that was charged but then failed).
 function refundTokens(email, freeTaken, paidTaken) {
@@ -329,6 +374,18 @@ function refundTokens(email, freeTaken, paidTaken) {
   if (freeTaken > 0 && user.freeDate === today) user.freeUsed = Math.max(0, (user.freeUsed || 0) - freeTaken);
   if (paidTaken > 0) user.paidTokens = (user.paidTokens || 0) + paidTaken;
   saveUsers(store);
+}
+// Refund a charged build exactly once (v1.3.2). A build that stalls or fails
+// after being charged gets its tokens back IN FULL — the searches it did run
+// are cached for the day, so a retry costs ~0 new searches anyway. Safe on
+// uncharged maps (no paidBy, e.g. built before v1.3.2) and on maps that were
+// already refunded: the `refunded` flag is the single-refund guarantee.
+function refundMapOnce(map) {
+  if (!map || map.refunded || !map.paidBy) return false;
+  refundTokens(map.paidBy, map.paidFree || 0, map.paidPaid || 0);
+  map.refunded = true;
+  upsertMap(map);
+  return true;
 }
 // Cost estimates (measured: one Depth-2 map ≈ 2,283 units; a trending run
 // ≈ 335 units). Deliberately conservative so the guard trips before the
@@ -389,6 +446,10 @@ function recordYtError(endpoint, status, reason, message) {
   const e = { endpoint, status, reason, message: String(message || '').slice(0, 300), at: new Date().toISOString() };
   lastYtErrors.unshift(e);
   if (lastYtErrors.length > 5) lastYtErrors.pop();
+  // Real-quota block (v1.3.2): a search answered with quotaExceeded means
+  // Google's daily search quota is gone — remember it for today so the
+  // search guard can block new builds BEFORE charging tokens for them.
+  if (reason === 'quotaExceeded' && String(endpoint || '').startsWith('/search')) markSearchBlocked();
   console.error(`[yt-error] ${endpoint} -> ${status} ${reason}: ${e.message}`);
   return e;
 }
@@ -416,6 +477,9 @@ async function yt(endpoint, params, key) {
     err.isInvalidKey = res.status === 400 && /API key not valid/i.test(msg);
     throw err;
   }
+  // A search that succeeds clears the real-quota block (v1.3.2) — e.g. the
+  // admin saved a key from a project whose search quota is still open.
+  if (endpoint.startsWith('/search')) clearSearchBlocked();
   return data;
 }
 function ytCost(endpoint) { return endpoint.startsWith('/search') ? 100 : 1; }
@@ -930,6 +994,7 @@ app.get('/api/status', (req, res) => {
     quotaRemaining: QUOTA_LIMIT - (s.quotaUsed || 0),
     searchUsed: s.searchUsed || 0, searchLimit: SEARCH_LIMIT,
     searchRemaining: SEARCH_LIMIT - (s.searchUsed || 0),
+    searchBlocked: isSearchBlockedToday(),
     me: { loggedIn: auth.loggedIn, email: auth.email, role: auth.role, allowed: auth.allowed },
     tokens
   });
@@ -948,6 +1013,7 @@ app.get('/api/diag', (req, res) => {
   res.json({
     ok: true, hasKey: !!s.apiKey, quotaUsed: s.quotaUsed || 0, quotaLimit: QUOTA_LIMIT, quotaDate: s.quotaDate,
     searchUsed: s.searchUsed || 0, searchLimit: SEARCH_LIMIT,
+    searchBlocked: isSearchBlockedToday(),
     lastYtError: lastYtErrors[0] || null, recentYtErrors: lastYtErrors, maps
   });
 });
@@ -967,6 +1033,9 @@ app.post('/api/settings/key', async (req, res) => {
   const s = quotaResetIfNeeded(getSettings());
   s.apiKey = key;
   saveSettings(s);
+  // A new key usually means a different project — its search quota is
+  // fresh, so a block recorded against the old key must not linger (v1.3.2).
+  clearSearchBlocked();
   res.json({ ok: true, message: 'API key saved.' });
 });
 
@@ -1033,6 +1102,10 @@ app.post('/api/maps', async (req, res) => {
   // cannot cover.
   const searchErr = searchGuardError(settings, 1);
   if (searchErr) return res.status(503).json({ ok: false, error: searchErr });
+  // Track the charge (v1.3.2): if anything fails AFTER the tokens were
+  // spent, the catch refunds them and removes the half-built map.
+  let charged = null;
+  let createdMapId = null;
   try {
     const channelId = await resolveChannel(input, settings.apiKey, settings);
     const details = await fetchChannelDetails([channelId], settings.apiKey, settings);
@@ -1052,9 +1125,12 @@ app.post('/api/maps', async (req, res) => {
       builtDepth: 0,
       quotaUsed: 0,
       createdAt: new Date().toISOString(),
-      channels: [Object.assign(seed, { depth: 0 })]
+      channels: [Object.assign(seed, { depth: 0 })],
+      // Who paid (v1.3.2): a later stall refunds exactly this spend.
+      paidBy: auth.email, paidFree: 0, paidPaid: 0, refunded: false
     };
     upsertMap(map);
+    createdMapId = map.id;
     // Charge only after the seed resolved — a failed seed never costs tokens.
     // (Race safety: if the charge fails, the just-created map is removed.)
     const spent = spendTokens(auth.email, cost);
@@ -1063,9 +1139,19 @@ app.post('/api/maps', async (req, res) => {
       flushSettings(settings);
       return res.status(402).json({ ok: false, error: spent.error, needTokens: true, cost });
     }
+    // Remember what was spent, so a later stall can refund exactly this.
+    map.paidFree = spent.freeTaken;
+    map.paidPaid = spent.paidTaken;
+    upsertMap(map);
+    charged = { email: auth.email, freeTaken: spent.freeTaken, paidTaken: spent.paidTaken };
     flushSettings(settings);
-    res.json({ ok: true, map, message: 'Seed found — building the rings now.', tokens: { balance: spent.balance, spent: cost } });
+    res.json({ ok: true, map, message: 'Seed found — building the rings now.', tokens: { balance: spent.balance, spent: spent.spent, unlimited: !!spent.unlimited } });
   } catch (e) {
+    if (charged) {
+      refundTokens(charged.email, charged.freeTaken, charged.paidTaken);
+      if (createdMapId) deleteMapById(createdMapId);
+      return res.status(400).json({ ok: false, error: (e.message || 'Failed to create the map.') + ' Your tokens were refunded.', refunded: true });
+    }
     res.status(e.status === 403 ? 403 : 400).json({ ok: false, error: e.message || 'Failed to create the map.' });
   }
 });
@@ -1097,8 +1183,8 @@ app.post('/api/maps/:id/expand', async (req, res) => {
     if (!map.nicheKeywords || !map.nicheKeywords.length) {
       map.status = 'stalled';
       map.stall = { ring: ringDepth, reason: 'This map has no niche keywords, so no search could run.', keywords: [], candidatesFound: 0, vettedPassed: 0, searchesOk: 0, searchesFailed: 0, quotaUsed: settings.quotaUsed || 0, at: new Date().toISOString() };
-      upsertMap(map);
-      return res.status(400).json({ ok: false, error: 'This map has no niche keywords, so no search could run. Please build a new map from a seed channel.', diagnostics: { searchesRun: 0, searchesOk: 0, searchesFailed: 0, noQueries: true } });
+      const wasRefunded = refundMapOnce(map); // v1.3.2: a stalled build is refunded (also persists the map)
+      return res.status(400).json({ ok: false, error: 'This map has no niche keywords, so no search could run. Please build a new map from a seed channel.' + (wasRefunded ? ' Your tokens for this build were refunded.' : ''), refunded: wasRefunded, diagnostics: { searchesRun: 0, searchesOk: 0, searchesFailed: 0, noQueries: true } });
     }
     const exclude = map.channels.map(c => c.id);
     const limit = target - map.channels.length;
@@ -1107,7 +1193,13 @@ app.post('/api/maps/:id/expand', async (req, res) => {
     // quota cannot cover them, stop here (map stays 'building', retryable
     // tomorrow) instead of stalling on a doomed ring.
     const ringSearchErr = searchGuardError(settings, uncachedSearchCount(searchJobsForNiche(map.niche)));
-    if (ringSearchErr) return res.status(503).json({ ok: false, error: ringSearchErr });
+    if (ringSearchErr) {
+      // The build cannot continue today — refund the original charge
+      // (v1.3.2). The map stays retryable: its searches are cached, so a
+      // retry tomorrow costs ~0 new searches.
+      const wasRefunded = refundMapOnce(map);
+      return res.status(503).json({ ok: false, error: ringSearchErr + (wasRefunded ? ' Your tokens for this build were refunded.' : ''), refunded: wasRefunded });
+    }
     const { neighbours, diagnostics } = await discoverNeighbours(map.niche, exclude, Math.max(limit, 0), settings.apiKey, settings);
     // TOTAL search failure: never silently save a seed-only ring as
     // progress — park the map as 'stalled' WITH the real YouTube reason
@@ -1136,12 +1228,13 @@ app.post('/api/maps/:id/expand', async (req, res) => {
         quotaUsed: settings.quotaUsed || 0,
         at: new Date().toISOString()
       };
-      upsertMap(map);
+      const wasRefunded = refundMapOnce(map); // v1.3.2: a stalled build is refunded (also persists the map)
       flushSettings(settings);
       return res.status(400).json({
         ok: false,
-        error: human + ' Check the quota, then press "Continue building" to retry.',
+        error: human + ' Check the quota, then press "Continue building" to retry.' + (wasRefunded ? ' Your tokens for this build were refunded.' : ''),
         yt: ytErr,
+        refunded: wasRefunded,
         diagnostics
       });
     }
@@ -1162,11 +1255,11 @@ app.post('/api/maps/:id/expand', async (req, res) => {
         quotaUsed: settings.quotaUsed || 0,
         at: new Date().toISOString()
       };
-      upsertMap(map);
+      const wasRefunded = refundMapOnce(map); // v1.3.2: a stalled build is refunded (also persists the map)
       flushSettings(settings);
       return res.json({
-        ok: true, map, done: false, stalled: true, diagnostics,
-        message: `Depth ${ringDepth}: 0 neighbours found — niche keywords (${(map.nicheKeywords || []).join(', ')}) matched ${diagnostics.candidatesFound} candidates, ${diagnostics.vettedPassed} passed the niche test.`
+        ok: true, map, done: false, stalled: true, diagnostics, refunded: wasRefunded,
+        message: `Depth ${ringDepth}: 0 neighbours found — niche keywords (${(map.nicheKeywords || []).join(', ')}) matched ${diagnostics.candidatesFound} candidates, ${diagnostics.vettedPassed} passed the niche test.` + (wasRefunded ? ' Your tokens for this build were refunded.' : '')
       });
     }
     for (const n of neighbours) { n.depth = ringDepth; map.channels.push(n); }
@@ -1816,6 +1909,9 @@ app.get('/api/trending', async (req, res) => {
   }
   const settings = needKey(res);
   if (!settings) return;
+  // Track the charge (v1.3.2): the run is charged only after it succeeds,
+  // but if saving the run or answering fails afterwards, refund it.
+  let trendCharged = null;
   try {
     // A FRESH trending run needs enough tokens (50) and enough shared quota.
     const trendCost = TOKEN_COST.trending;
@@ -1843,12 +1939,17 @@ app.get('/api/trending', async (req, res) => {
     // run (the user keeps their tokens and can retry).
     const spent = spendTokens(auth.email, trendCost);
     if (!spent.ok) return res.status(402).json({ ok: false, error: spent.error, needTokens: true, cost: trendCost });
+    trendCharged = { email: auth.email, freeTaken: spent.freeTaken, paidTaken: spent.paidTaken };
     const record = { niche: nicheLabel, keywords, language: detectLangFamily(keywords.join(' ')), date: today, asOf: new Date().toISOString(), quotaUsed: run.quotaUsed, channels: run.channels };
     runs[cacheKey] = record;
     saveTrendingCache(runs);
     flushSettings(settings);
-    res.json({ ok: true, allowed: canSee, cached: false, niche: nicheLabel, keywords, asOf: record.asOf, quotaUsed: run.quotaUsed, count: run.channels.length, channels: canSee ? run.channels : run.channels.map(maskTrendingChannel), note, tokens: { balance: spent.balance, spent: trendCost } });
+    res.json({ ok: true, allowed: canSee, cached: false, niche: nicheLabel, keywords, asOf: record.asOf, quotaUsed: run.quotaUsed, count: run.channels.length, channels: canSee ? run.channels : run.channels.map(maskTrendingChannel), note, tokens: { balance: spent.balance, spent: spent.spent, unlimited: !!spent.unlimited } });
   } catch (e) {
+    if (trendCharged) {
+      refundTokens(trendCharged.email, trendCharged.freeTaken, trendCharged.paidTaken);
+      return res.status(400).json({ ok: false, error: (e.message || 'Failed to load trending data.') + ' Your tokens were refunded.', refunded: true });
+    }
     res.status(400).json({ ok: false, error: e.message || 'Failed to load trending data.' });
   }
 });
