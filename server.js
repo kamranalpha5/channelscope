@@ -1,5 +1,6 @@
 // ChannelScope (standalone) — YouTube competitor-mapping tool.
-// Runs on your own PC. Uses YOUR YouTube Data API v3 key (stored locally only).
+// Runs on your own PC. Uses YOUR YouTube Data API v3 key (stored locally only,
+// or from the YOUTUBE_API_KEY env var — v1.3.4, survives free-plan restarts).
 // Neighbour discovery NEVER uses relatedToVideoId (YouTube removed it Aug 2023).
 // Niche is derived per seed channel from that channel's own titles/tags/category.
 
@@ -71,6 +72,21 @@ function getSettings() {
   return loadJson(SETTINGS_FILE, { apiKey: '', quotaUsed: 0, quotaDate: '' });
 }
 function saveSettings(s) { saveJson(SETTINGS_FILE, s); }
+// ---------- YouTube API key (v1.3.4) ----------
+// The site's ONE key can come from two places. The admin-panel-saved key in
+// settings.json wins when present; otherwise the YOUTUBE_API_KEY env var
+// (Render dashboard) is used. The env route survives free-plan restarts,
+// which wipe data/settings.json. This is a pure resolver: it never writes
+// anything, so the env key is never persisted into settings.json (quota
+// saves via saveSettingsSoon would otherwise copy it there). The key value
+// is NEVER logged or included in any response — only the boolean hasKey
+// is ever exposed.
+function effectiveApiKey(settings) {
+  const s = settings || getSettings();
+  if (s.apiKey && String(s.apiKey).trim()) return s.apiKey;
+  const envKey = (process.env.YOUTUBE_API_KEY || '').trim();
+  return envKey || '';
+}
 function getMaps() { return loadJson(MAPS_FILE, { maps: [] }).maps; }
 function saveMaps(maps) { saveJson(MAPS_FILE, { maps }); }
 function todayStr() { return new Date().toISOString().slice(0, 10); }
@@ -899,7 +915,7 @@ async function discoverNeighbours(niche, excludeIds, limit, key, settings) {
 // ---------- helpers for routes ----------
 function needKey(res) {
   const s = quotaResetIfNeeded(getSettings());
-  if (!s.apiKey) {
+  if (!effectiveApiKey(s)) {
     // Single-key model: only the owner's key runs the site. Visitors are
     // never asked for a key — they get this friendly message instead.
     res.status(503).json({ ok: false, error: 'Service is being set up — please try again later.' });
@@ -990,7 +1006,7 @@ app.get('/api/status', (req, res) => {
   // Quota display: shared quota + the caller's own token balance.
   const tokens = auth.loggedIn ? tokenState(auth.email) : null;
   res.json({
-    ok: true, hasKey: !!s.apiKey, quotaUsed: s.quotaUsed || 0, quotaLimit: QUOTA_LIMIT, quotaDate: s.quotaDate,
+    ok: true, hasKey: !!effectiveApiKey(s), quotaUsed: s.quotaUsed || 0, quotaLimit: QUOTA_LIMIT, quotaDate: s.quotaDate,
     quotaRemaining: QUOTA_LIMIT - (s.quotaUsed || 0),
     searchUsed: s.searchUsed || 0, searchLimit: SEARCH_LIMIT,
     searchRemaining: SEARCH_LIMIT - (s.searchUsed || 0),
@@ -1011,7 +1027,7 @@ app.get('/api/diag', (req, res) => {
     stall: m.stall || null, createdAt: m.createdAt
   }));
   res.json({
-    ok: true, hasKey: !!s.apiKey, quotaUsed: s.quotaUsed || 0, quotaLimit: QUOTA_LIMIT, quotaDate: s.quotaDate,
+    ok: true, hasKey: !!effectiveApiKey(s), quotaUsed: s.quotaUsed || 0, quotaLimit: QUOTA_LIMIT, quotaDate: s.quotaDate,
     searchUsed: s.searchUsed || 0, searchLimit: SEARCH_LIMIT,
     searchBlocked: isSearchBlockedToday(),
     lastYtError: lastYtErrors[0] || null, recentYtErrors: lastYtErrors, maps
@@ -1041,6 +1057,8 @@ app.post('/api/settings/key', async (req, res) => {
 
 app.delete('/api/settings/key', (req, res) => {
   if (!requireAdmin(req, res)) return;
+  // Clears only the saved key — a YOUTUBE_API_KEY env var (v1.3.4) still
+  // applies afterwards, so hasKey may stay true.
   const s = getSettings();
   s.apiKey = '';
   saveSettings(s);
@@ -1107,11 +1125,11 @@ app.post('/api/maps', async (req, res) => {
   let charged = null;
   let createdMapId = null;
   try {
-    const channelId = await resolveChannel(input, settings.apiKey, settings);
-    const details = await fetchChannelDetails([channelId], settings.apiKey, settings);
+    const channelId = await resolveChannel(input, effectiveApiKey(settings), settings);
+    const details = await fetchChannelDetails([channelId], effectiveApiKey(settings), settings);
     if (!details.length) return res.status(404).json({ ok: false, error: 'Channel not found.' });
     const item = details[0];
-    const seedVideos = await fetchChannelVideos(channelId, (item.contentDetails.relatedPlaylists || {}).uploads, settings.apiKey, settings, 20);
+    const seedVideos = await fetchChannelVideos(channelId, (item.contentDetails.relatedPlaylists || {}).uploads, effectiveApiKey(settings), settings, 20);
     const seed = channelSummary(item, seedVideos);
     const niche = deriveNiche(seed, seedVideos);
     const map = {
@@ -1200,7 +1218,7 @@ app.post('/api/maps/:id/expand', async (req, res) => {
       const wasRefunded = refundMapOnce(map);
       return res.status(503).json({ ok: false, error: ringSearchErr + (wasRefunded ? ' Your tokens for this build were refunded.' : ''), refunded: wasRefunded });
     }
-    const { neighbours, diagnostics } = await discoverNeighbours(map.niche, exclude, Math.max(limit, 0), settings.apiKey, settings);
+    const { neighbours, diagnostics } = await discoverNeighbours(map.niche, exclude, Math.max(limit, 0), effectiveApiKey(settings), settings);
     // TOTAL search failure: never silently save a seed-only ring as
     // progress — park the map as 'stalled' WITH the real YouTube reason
     // (status + reason + message) and return it, so the UI can show what
@@ -1697,7 +1715,7 @@ app.post('/api/maps/:id/videos/:videoId/replicate', async (req, res) => {
     // Fresh metadata from YouTube (description chapters + duration).
     let meta = null;
     try {
-      const d = await yt('/videos', { part: 'snippet,contentDetails,statistics', id: video.id }, settings.apiKey);
+      const d = await yt('/videos', { part: 'snippet,contentDetails,statistics', id: video.id }, effectiveApiKey(settings));
       addQuota(settings, ytCost('/videos'));
       meta = (d.items || [])[0] || null;
     } catch (e) { /* use stored data */ }
@@ -1924,7 +1942,7 @@ app.get('/api/trending', async (req, res) => {
     for (const q of keywords.slice(0, TRENDING_SEARCH_KEYWORDS)) { if (searchCacheGet('trend', q) === null) trendNeeded++; }
     const trendSearchErr = searchGuardError(settings, trendNeeded);
     if (trendSearchErr) return res.status(503).json({ ok: false, error: trendSearchErr });
-    const run = await runTrending(keywords, settings.apiKey, settings);
+    const run = await runTrending(keywords, effectiveApiKey(settings), settings);
     // If the run found nothing AND the searches themselves failed, say so
     // with the real YouTube reason — an empty list must not hide the error.
     if (!run.channels.length && run.searchError) {
@@ -2422,4 +2440,4 @@ function startServer(port, attemptsLeft) {
 // require() this file and use the exported helpers without starting a server.
 ensureAdminFromEnv();
 if (require.main === module) startServer(PORT, 5);
-module.exports = { app, tokenize, detectLangFamily, deriveNiche, nicheTest, median, ensureAdminFromEnv, getAuth, buildChannelIndex, vphOf };
+module.exports = { app, tokenize, detectLangFamily, deriveNiche, nicheTest, median, ensureAdminFromEnv, getAuth, buildChannelIndex, vphOf, effectiveApiKey };
