@@ -1,6 +1,8 @@
 // ChannelScope (standalone) — YouTube competitor-mapping tool.
 // Runs on your own PC. Uses YOUR YouTube Data API v3 key (stored locally only,
 // or from the YOUTUBE_API_KEY env var — v1.3.4, survives free-plan restarts).
+// v1.4.0: persistent state lives in Postgres when DATABASE_URL is set
+// (Neon on Render — survives free-plan restarts); JSON files otherwise.
 // Neighbour discovery NEVER uses relatedToVideoId (YouTube removed it Aug 2023).
 // Niche is derived per seed channel from that channel's own titles/tags/category.
 
@@ -8,6 +10,10 @@ const express = require('express');
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
+
+// In-app version string (v1.4.0): exposed on /api/status and /api/diag so a
+// deploy can be verified live without opening any page.
+const APP_VERSION = '1.4.0';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -59,7 +65,152 @@ app.get('/terms', (req, res) => res.sendFile(path.join(__dirname, 'public', 'ter
 app.use(express.json({ limit: '1mb' }));
 app.use(express.static(path.join(__dirname, 'public')));
 
-// ---------- storage (plain JSON files, no native modules) ----------
+// ---------- storage: JSON files OR Postgres (v1.4.0) ----------
+// Two backends, one interface. LOCAL (default): plain JSON files under
+// data/ — exactly as before, no new dependency, no behaviour change.
+// DATABASE (DATABASE_URL env var set — a Neon pooled connection string
+// on Render): ALL persistent state lives in Postgres; the JSON files are
+// never read or written. Tables are created automatically on boot
+// (CREATE TABLE IF NOT EXISTS) — no manual migration step.
+//   cs_settings       one row key='settings': {apiKey, quotaUsed,
+//                       quotaDate, searchUsed, searchDate}
+//   cs_users          one row per user: the full user object (password
+//                       hash, role, plan, paidTokens, freeUsed...)
+//   cs_allowlist      one row per allowlisted email
+//   cs_maps           one row per map: the full map object (channels,
+//                       niche, paidBy/refunded, stall...)
+//   cs_search_cache   one row per cached search: key "<kind>|<query>"
+//                       -> value, cache_date (day)
+//   cs_search_blocked one row id='blocked': {blocked_date}
+//   cs_secret         one row id='secret': session-signing secret
+//   cs_trending       one row per trending niche key: run record
+//   cs_yt_cache       one row per cached YouTube record:
+//                       "channel|<id>", "videos|<ch>:<max>",
+//                       "handle|<handle>" -> value, fetched_at
+// JSON payloads are stored in jsonb — the faithful mapping: what the
+// file held, the row holds.
+// HOW IT WORKS (and its limit): the app's getters are synchronous and
+// node-postgres is async-only, so in DB mode the whole state is loaded
+// into an in-memory snapshot at boot (initStore, awaited before the
+// server listens) and every save updates the snapshot AND issues the
+// matching Postgres upsert/delete immediately (write-through). Reads
+// never touch the JSON files in DB mode. The residual window is a crash
+// in the milliseconds between a snapshot update and its query landing;
+// pending writes are awaited on SIGTERM (Render restart) before exit.
+// Single-process deployment (Render free plan runs one instance), so
+// the snapshot cannot go stale from another writer.
+const DATABASE_URL = (process.env.DATABASE_URL || '').trim();
+let dbModeOverride = false; // test seam: initStore(fakePool) enables DB mode
+function isDbMode() { return !!DATABASE_URL || dbModeOverride; }
+let storePool = null;
+let storeSnapshot = null;
+const pendingDbWrites = [];
+function dbGuard() {
+  if (isDbMode() && !storeSnapshot) throw new Error('Postgres store is not initialised — initStore() must run before the first request (DATABASE_URL is set).');
+}
+// The pg driver is required lazily so JSON mode never touches it (no new
+// dependency at runtime there). Pool: small (max 5) with a short idle
+// timeout — the Render free plan sleeps, and connections must not hang
+// boot. SSL is required: Neon only accepts TLS connections.
+function getPgPool() {
+  if (storePool) return storePool;
+  let Pool;
+  try { ({ Pool } = require('pg')); }
+  catch (e) { throw new Error("Postgres driver 'pg' is not installed — run npm install (DATABASE_URL is set)."); }
+  storePool = new Pool({
+    connectionString: DATABASE_URL,
+    ssl: { rejectUnauthorized: false },
+    max: 5,
+    idleTimeoutMillis: 10000,
+    connectionTimeoutMillis: 5000
+  });
+  storePool.on('error', (err) => console.error('[db] idle pool client error:', err.message));
+  return storePool;
+}
+function dbQuery(sql, params) {
+  if (!storePool) return Promise.resolve(null);
+  const p = storePool.query(sql, params || []);
+  pendingDbWrites.push(p);
+  const drop = () => { const i = pendingDbWrites.indexOf(p); if (i >= 0) pendingDbWrites.splice(i, 1); };
+  p.then(drop, (e) => { drop(); console.error('[db] write failed:', e.message); });
+  return p;
+}
+async function flushStoreWrites() {
+  await Promise.allSettled(pendingDbWrites.slice());
+}
+async function closeStore() {
+  await flushStoreWrites();
+  if (storePool && typeof storePool.end === 'function') {
+    try { await storePool.end(); } catch (e) { /* ignore */ }
+    storePool = null;
+  }
+}
+// ---------- database-first record-cache TTLs (v1.4.0) ----------
+// Channel / video / handle records: 24h. A trending run: 6h (shorter —
+// trending data goes stale faster than a channel's own facts). Search
+// entries keep their existing daily semantics (same-day reuse).
+const CHANNEL_TTL_MS = 24 * 3600 * 1000;
+const VIDEO_TTL_MS = 24 * 3600 * 1000;
+const TRENDING_TTL_MS = 6 * 3600 * 1000;
+const CACHE_TTLS = { channel: CHANNEL_TTL_MS, videos: VIDEO_TTL_MS, handle: CHANNEL_TTL_MS };
+const CREATE_TABLE_SQL = [
+  'CREATE TABLE IF NOT EXISTS cs_settings (key TEXT PRIMARY KEY, value JSONB NOT NULL)',
+  'CREATE TABLE IF NOT EXISTS cs_users (email TEXT PRIMARY KEY, data JSONB NOT NULL)',
+  'CREATE TABLE IF NOT EXISTS cs_allowlist (email TEXT PRIMARY KEY)',
+  'CREATE TABLE IF NOT EXISTS cs_maps (id TEXT PRIMARY KEY, data JSONB NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT now())',
+  'CREATE TABLE IF NOT EXISTS cs_search_cache (cache_key TEXT PRIMARY KEY, value JSONB NOT NULL, cache_date TEXT NOT NULL)',
+  'CREATE TABLE IF NOT EXISTS cs_search_blocked (id TEXT PRIMARY KEY, blocked_date TEXT NOT NULL)',
+  'CREATE TABLE IF NOT EXISTS cs_secret (id TEXT PRIMARY KEY, secret TEXT NOT NULL)',
+  'CREATE TABLE IF NOT EXISTS cs_trending (cache_key TEXT PRIMARY KEY, data JSONB NOT NULL, as_of TIMESTAMPTZ NOT NULL DEFAULT now())',
+  'CREATE TABLE IF NOT EXISTS cs_yt_cache (cache_key TEXT PRIMARY KEY, value JSONB NOT NULL, fetched_at TIMESTAMPTZ NOT NULL)'
+];
+// Create tables (if needed) and load every row into the snapshot. Called
+// once at boot in DB mode (awaited before listen) and by tests with a
+// fake pool — pass a pool-like { query(sql, params) } to test DB-mode
+// paths without a live database.
+async function initStore(poolOverride) {
+  const pool = poolOverride || getPgPool();
+  storePool = pool;
+  dbModeOverride = true;
+  for (const sql of CREATE_TABLE_SQL) await pool.query(sql);
+  // Best-effort stale-row cleanup (never fails boot).
+  try { await pool.query('DELETE FROM cs_search_cache WHERE cache_date <> $1', [todayStr()]); } catch (e) { /* ignore */ }
+  try { await pool.query('DELETE FROM cs_yt_cache WHERE fetched_at < $1', [new Date(Date.now() - CHANNEL_TTL_MS).toISOString()]); } catch (e) { /* ignore */ }
+  const snap = {
+    settings: { apiKey: '', quotaUsed: 0, quotaDate: '' },
+    users: { users: [], allowlist: [] },
+    maps: [],
+    searchCache: { date: todayStr(), entries: {} },
+    searchBlocked: { date: '' },
+    secret: null,
+    trending: { runs: {} },
+    ytCache: {},
+    knownMapIds: new Set(), knownUserEmails: new Set(), knownAllowlist: new Set()
+  };
+  const sRows = ((await pool.query('SELECT key, value FROM cs_settings')).rows || []);
+  for (const r of sRows) if (r.key === 'settings' && r.value) snap.settings = r.value;
+  const uRows = ((await pool.query('SELECT email, data FROM cs_users')).rows || []);
+  for (const r of uRows) if (r.data) { snap.users.users.push(r.data); snap.knownUserEmails.add(r.email); }
+  const aRows = ((await pool.query('SELECT email FROM cs_allowlist')).rows || []);
+  for (const r of aRows) if (r.email) { snap.users.allowlist.push(r.email); snap.knownAllowlist.add(r.email); }
+  const mRows = ((await pool.query('SELECT id, data FROM cs_maps')).rows || []);
+  for (const r of mRows) if (r.data) { snap.maps.push(r.data); snap.knownMapIds.add(r.id); }
+  const cRows = ((await pool.query('SELECT cache_key, value, cache_date FROM cs_search_cache')).rows || []);
+  for (const r of cRows) if (r.cache_date === todayStr()) snap.searchCache.entries[r.cache_key] = r.value;
+  const bRows = ((await pool.query('SELECT id, blocked_date FROM cs_search_blocked')).rows || []);
+  for (const r of bRows) if (r.id === 'blocked') snap.searchBlocked = { date: r.blocked_date || '' };
+  const secRows = ((await pool.query('SELECT id, secret FROM cs_secret')).rows || []);
+  for (const r of secRows) if (r.id === 'secret') snap.secret = r.secret;
+  const tRows = ((await pool.query('SELECT cache_key, data FROM cs_trending')).rows || []);
+  for (const r of tRows) if (r.data) snap.trending.runs[r.cache_key] = r.data;
+  const yRows = ((await pool.query('SELECT cache_key, value, fetched_at FROM cs_yt_cache')).rows || []);
+  for (const r of yRows) {
+    const at = new Date(r.fetched_at).getTime();
+    if (!isNaN(at) && Date.now() - at <= CHANNEL_TTL_MS) snap.ytCache[r.cache_key] = { value: r.value, fetchedAt: at };
+  }
+  storeSnapshot = snap;
+  return snap;
+}
 function loadJson(file, fallback) {
   try { return JSON.parse(fs.readFileSync(file, 'utf8')); }
   catch (e) { return fallback; }
@@ -69,9 +220,79 @@ function saveJson(file, obj) {
   fs.writeFileSync(file, JSON.stringify(obj, null, 2), 'utf8');
 }
 function getSettings() {
+  if (isDbMode()) { dbGuard(); return storeSnapshot.settings; }
   return loadJson(SETTINGS_FILE, { apiKey: '', quotaUsed: 0, quotaDate: '' });
 }
-function saveSettings(s) { saveJson(SETTINGS_FILE, s); }
+function saveSettings(s) {
+  if (isDbMode()) {
+    dbGuard();
+    storeSnapshot.settings = s;
+    dbQuery('INSERT INTO cs_settings (key, value) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value', ['settings', s]);
+    return;
+  }
+  saveJson(SETTINGS_FILE, s);
+}
+function getMaps() {
+  if (isDbMode()) { dbGuard(); return storeSnapshot.maps; }
+  return loadJson(MAPS_FILE, { maps: [] }).maps;
+}
+function saveMaps(maps) {
+  if (isDbMode()) {
+    dbGuard();
+    const seen = new Set();
+    for (const m of maps) {
+      seen.add(m.id);
+      dbQuery('INSERT INTO cs_maps (id, data) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data, updated_at = now()', [m.id, m]);
+    }
+    for (const id of storeSnapshot.knownMapIds) if (!seen.has(id)) dbQuery('DELETE FROM cs_maps WHERE id = $1', [id]);
+    storeSnapshot.knownMapIds = seen;
+    storeSnapshot.maps = maps;
+    return;
+  }
+  saveJson(MAPS_FILE, { maps });
+}
+// Users + allowlist. In DB mode: one cs_users row per user, one
+// cs_allowlist row per allowlisted email. In JSON mode: data/users.json.
+// (Free-plan restarts wipe data/ — in DB mode the admin/users survive,
+// so ADMIN_EMAIL/ADMIN_PASSWORD env re-creation is only a fallback.)
+const USERS_FILE = path.join(DATA_DIR, 'users.json');
+const SECRET_FILE = path.join(DATA_DIR, 'secret.json');
+function getUsers() {
+  if (isDbMode()) { dbGuard(); return storeSnapshot.users; }
+  return loadJson(USERS_FILE, { users: [], allowlist: [] });
+}
+function saveUsers(u) {
+  if (isDbMode()) {
+    dbGuard();
+    const seenU = new Set();
+    for (const user of (u.users || [])) {
+      seenU.add(user.email);
+      dbQuery('INSERT INTO cs_users (email, data) VALUES ($1, $2) ON CONFLICT (email) DO UPDATE SET data = EXCLUDED.data', [user.email, user]);
+    }
+    for (const email of storeSnapshot.knownUserEmails) if (!seenU.has(email)) dbQuery('DELETE FROM cs_users WHERE email = $1', [email]);
+    const seenA = new Set(u.allowlist || []);
+    for (const email of seenA) dbQuery('INSERT INTO cs_allowlist (email) VALUES ($1) ON CONFLICT (email) DO NOTHING', [email]);
+    for (const email of storeSnapshot.knownAllowlist) if (!seenA.has(email)) dbQuery('DELETE FROM cs_allowlist WHERE email = $1', [email]);
+    storeSnapshot.knownUserEmails = seenU;
+    storeSnapshot.knownAllowlist = seenA;
+    storeSnapshot.users = u;
+    return;
+  }
+  saveJson(USERS_FILE, u);
+}
+function getSecret() {
+  if (isDbMode()) {
+    dbGuard();
+    if (!storeSnapshot.secret) {
+      storeSnapshot.secret = crypto.randomBytes(32).toString('hex');
+      dbQuery('INSERT INTO cs_secret (id, secret) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET secret = EXCLUDED.secret', ['secret', storeSnapshot.secret]);
+    }
+    return storeSnapshot.secret;
+  }
+  let s = loadJson(SECRET_FILE, null);
+  if (!s || !s.secret) { s = { secret: crypto.randomBytes(32).toString('hex') }; saveJson(SECRET_FILE, s); }
+  return s.secret;
+}
 // ---------- YouTube API key (v1.3.4) ----------
 // The site's ONE key can come from two places. The admin-panel-saved key in
 // settings.json wins when present; otherwise the YOUTUBE_API_KEY env var
@@ -87,25 +308,14 @@ function effectiveApiKey(settings) {
   const envKey = (process.env.YOUTUBE_API_KEY || '').trim();
   return envKey || '';
 }
-function getMaps() { return loadJson(MAPS_FILE, { maps: [] }).maps; }
-function saveMaps(maps) { saveJson(MAPS_FILE, { maps }); }
 function todayStr() { return new Date().toISOString().slice(0, 10); }
 
 // ---------- auth: email + password, allowlist-gated Overview/Trending ----------
 // Passwords: node:crypto scrypt (no new npm dependency). Sessions: HMAC-signed
-// cookie token. Users + allowlist live in data/users.json — on the free Render
-// plan a restart can reset data/, so the admin may need to re-add them
-// (see README caveat; ADMIN_EMAIL/ADMIN_PASSWORD env vars re-create the admin
-// automatically on every boot).
-const USERS_FILE = path.join(DATA_DIR, 'users.json');
-const SECRET_FILE = path.join(DATA_DIR, 'secret.json');
-function getUsers() { return loadJson(USERS_FILE, { users: [], allowlist: [] }); }
-function saveUsers(u) { saveJson(USERS_FILE, u); }
-function getSecret() {
-  let s = loadJson(SECRET_FILE, null);
-  if (!s || !s.secret) { s = { secret: crypto.randomBytes(32).toString('hex') }; saveJson(SECRET_FILE, s); }
-  return s.secret;
-}
+// cookie token. Users + allowlist live in data/users.json in JSON mode, or in
+// Postgres (cs_users / cs_allowlist) in DB mode — see the storage layer above.
+// In DB mode a free-plan restart no longer resets them; ADMIN_EMAIL /
+// ADMIN_PASSWORD env vars still re-create the admin on every boot as a fallback.
 function normEmail(e) { return String(e || '').trim().toLowerCase(); }
 function validEmail(e) { return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e); }
 function hashPassword(password) {
@@ -193,8 +403,13 @@ function maskTrendingChannel(c) {
 }
 
 function quotaResetIfNeeded(s) {
-  if (s.quotaDate !== todayStr()) { s.quotaUsed = 0; s.quotaDate = todayStr(); }
-  if (s.searchDate !== todayStr()) { s.searchUsed = 0; s.searchDate = todayStr(); }
+  let changed = false;
+  if (s.quotaDate !== todayStr()) { s.quotaUsed = 0; s.quotaDate = todayStr(); changed = true; }
+  if (s.searchDate !== todayStr()) { s.searchUsed = 0; s.searchDate = todayStr(); changed = true; }
+  // In DB mode the reset must reach Postgres at once — the snapshot is
+  // shared in-process, but a restart before the next save would otherwise
+  // resurrect yesterday's counters.
+  if (changed && isDbMode()) { try { saveSettings(s); } catch (e) { /* ignore */ } }
   return s;
 }
 function addQuota(s, units) {
@@ -250,6 +465,12 @@ function quotaExceededHint(ytErr) {
 const SEARCH_CACHE_FILE = path.join(DATA_DIR, 'search-cache.json');
 const SEARCH_CACHE_MAX = 1000;
 function getSearchCache() {
+  if (isDbMode()) {
+    dbGuard();
+    const c = storeSnapshot.searchCache;
+    if (c.date !== todayStr()) return { date: todayStr(), entries: {} };
+    return c;
+  }
   const c = loadJson(SEARCH_CACHE_FILE, { date: '', entries: {} });
   if (c.date !== todayStr()) return { date: todayStr(), entries: {} };
   return c;
@@ -264,7 +485,15 @@ function searchCacheSet(kind, q, value) {
   const c = getSearchCache();
   c.entries[searchCacheKey(kind, q)] = value;
   const keys = Object.keys(c.entries);
-  if (keys.length > SEARCH_CACHE_MAX) { for (const k of keys.slice(0, keys.length - SEARCH_CACHE_MAX)) delete c.entries[k]; }
+  const evicted = keys.length > SEARCH_CACHE_MAX ? keys.slice(0, keys.length - SEARCH_CACHE_MAX) : [];
+  for (const k of evicted) delete c.entries[k];
+  if (isDbMode()) {
+    dbGuard();
+    storeSnapshot.searchCache = c;
+    dbQuery('INSERT INTO cs_search_cache (cache_key, value, cache_date) VALUES ($1, $2, $3) ON CONFLICT (cache_key) DO UPDATE SET value = EXCLUDED.value, cache_date = EXCLUDED.cache_date', [searchCacheKey(kind, q), value, todayStr()]);
+    for (const k of evicted) dbQuery('DELETE FROM cs_search_cache WHERE cache_key = $1', [k]);
+    return;
+  }
   saveJson(SEARCH_CACHE_FILE, c);
 }
 // Disk writes are debounced: parallel API storms used to do one sync write per
@@ -272,6 +501,9 @@ function searchCacheSet(kind, q, value) {
 // of a map build / ring expand.
 let settingsSaveTimer = null;
 function saveSettingsSoon(s) {
+  // DB mode: write through immediately — a debounced write could be lost
+  // when Render sleeps the free instance before the timer fires.
+  if (isDbMode()) { try { saveSettings(s); } catch (e) { /* ignore */ } return; }
   if (settingsSaveTimer) return;
   settingsSaveTimer = setTimeout(() => { settingsSaveTimer = null; try { saveSettings(s); } catch (e) { /* ignore */ } }, 400);
 }
@@ -285,17 +517,63 @@ function saveSettingsSoon(s) {
 // succeeds, or when the admin saves a new API key.
 const SEARCH_BLOCKED_FILE = path.join(DATA_DIR, 'search-blocked.json');
 function searchBlockedDate() {
+  if (isDbMode()) { dbGuard(); return storeSnapshot.searchBlocked.date || ''; }
   const b = loadJson(SEARCH_BLOCKED_FILE, { date: '' });
   return b.date || '';
 }
 function isSearchBlockedToday() { return searchBlockedDate() === todayStr(); }
 function markSearchBlocked() {
   if (searchBlockedDate() === todayStr()) return;
+  if (isDbMode()) {
+    dbGuard();
+    storeSnapshot.searchBlocked = { date: todayStr() };
+    dbQuery('INSERT INTO cs_search_blocked (id, blocked_date) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET blocked_date = EXCLUDED.blocked_date', ['blocked', todayStr()]);
+    return;
+  }
   saveJson(SEARCH_BLOCKED_FILE, { date: todayStr() });
 }
 function clearSearchBlocked() {
   if (!searchBlockedDate()) return;
+  if (isDbMode()) {
+    dbGuard();
+    storeSnapshot.searchBlocked = { date: '' };
+    dbQuery('INSERT INTO cs_search_blocked (id, blocked_date) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET blocked_date = EXCLUDED.blocked_date', ['blocked', '']);
+    return;
+  }
   saveJson(SEARCH_BLOCKED_FILE, { date: '' });
+}
+
+// ---------- database-first YouTube record cache (v1.4.0, DB mode only) ----------
+// Channel / video / handle records are served from cs_yt_cache first and
+// only fetched from YouTube on a miss or after the TTL (24h). In JSON mode
+// these helpers are no-ops, so local behaviour is exactly as before — the
+// per-build cache and the daily search cache already cover that mode.
+// Cached reads cost no search call and no quota; a fully-cached build
+// still costs its token charge as today (pricing is unchanged).
+function ytCacheGet(kind, key) {
+  if (!isDbMode()) return null;
+  dbGuard();
+  const row = storeSnapshot.ytCache[kind + '|' + key];
+  if (!row) return null;
+  if (Date.now() - row.fetchedAt > (CACHE_TTLS[kind] || CHANNEL_TTL_MS)) return null;
+  return row.value;
+}
+function ytCacheSet(kind, key, value) {
+  if (!isDbMode()) return;
+  dbGuard();
+  const ck = kind + '|' + key;
+  storeSnapshot.ytCache[ck] = { value, fetchedAt: Date.now() };
+  dbQuery('INSERT INTO cs_yt_cache (cache_key, value, fetched_at) VALUES ($1, $2, $3) ON CONFLICT (cache_key) DO UPDATE SET value = EXCLUDED.value, fetched_at = EXCLUDED.fetched_at', [ck, value, new Date().toISOString()]);
+}
+// A trending run is fresh for 6h in DB mode (TRENDING_TTL_MS); in JSON mode
+// the existing daily rule stands (same-day run is fresh).
+function trendingCacheFresh(hit) {
+  if (!hit) return false;
+  if (isDbMode()) {
+    const at = new Date(hit.asOf || 0).getTime();
+    return !isNaN(at) && (Date.now() - at) < TRENDING_TTL_MS;
+  }
+  return hit.date === todayStr();
 }
 
 // ---------- tokens + quota protection ----------
@@ -635,9 +913,15 @@ async function resolveChannel(input, key, settings) {
   if (parsed.type === 'id') {
     channelId = parsed.value;
   } else if (parsed.type === 'handle') {
-    const d = await yt('/channels', { part: 'id', forHandle: parsed.value }, key);
-    addQuota(settings, ytCost('/channels'));
-    if (d.items && d.items.length) channelId = d.items[0].id;
+    // Database-first (v1.4.0, DB mode only): a handle resolved in the last
+    // 24h is served from cs_yt_cache — no channels.list call, no quota.
+    if (isDbMode()) channelId = ytCacheGet('handle', parsed.value.toLowerCase());
+    if (!channelId) {
+      const d = await yt('/channels', { part: 'id', forHandle: parsed.value }, key);
+      addQuota(settings, ytCost('/channels'));
+      if (d.items && d.items.length) channelId = d.items[0].id;
+      if (channelId) ytCacheSet('handle', parsed.value.toLowerCase(), channelId);
+    }
   }
   if (!channelId) {
     // Fallback: search by name/handle text (100 units) — cached per day,
@@ -662,7 +946,18 @@ async function resolveChannel(input, key, settings) {
 
 async function fetchChannelDetails(ids, key, settings, cache) {
   // With a build cache, already-fetched channels are never fetched twice.
-  const fetchIds = cache ? ids.filter(id => !cache.channels.has(id)) : ids;
+  // Database-first (v1.4.0, DB mode only): ids already in cs_yt_cache
+  // (24h TTL) are served from there — no channels.list call, no quota.
+  const store = cache || { channels: new Map() };
+  let fetchIds = ids.filter(id => !store.channels.has(id));
+  if (isDbMode()) {
+    const miss = [];
+    for (const id of fetchIds) {
+      const hit = ytCacheGet('channel', id);
+      if (hit) store.channels.set(id, hit); else miss.push(id);
+    }
+    fetchIds = miss;
+  }
   if (fetchIds.length) {
     const chunks = [];
     for (let i = 0; i < fetchIds.length; i += 50) chunks.push(fetchIds.slice(i, i + 50));
@@ -674,17 +969,26 @@ async function fetchChannelDetails(ids, key, settings, cache) {
       addQuota(settings, ytCost('/channels'));
       return d.items || [];
     }, 4);
-    for (const items of results) for (const it of (items || [])) if (cache) cache.channels.set(it.id, it);
-    if (!cache) return results.flat();
+    for (const items of results) for (const it of (items || [])) {
+      store.channels.set(it.id, it);
+      ytCacheSet('channel', it.id, it); // no-op in JSON mode
+    }
   }
-  return ids.map(id => cache.channels.get(id)).filter(Boolean);
+  return ids.map(id => store.channels.get(id)).filter(Boolean);
 }
 
 async function fetchChannelVideos(channelId, uploadsPlaylistId, key, settings, max = 20, cache) {
   const cacheKey = channelId + ':' + max;
   if (cache && cache.videos.has(cacheKey)) return cache.videos.get(cacheKey);
+  // Database-first (v1.4.0, DB mode only): a video list fetched in the
+  // last 24h is served from cs_yt_cache — no playlistItems/videos call.
+  if (isDbMode()) {
+    const hit = ytCacheGet('videos', cacheKey);
+    if (hit) { if (cache) cache.videos.set(cacheKey, hit); return hit; }
+  }
   let videoIds = [];
   let pageToken = '';
+  let playlistOk = false;
   try {
     while (videoIds.length < max) {
       const d = await yt('/playlistItems', {
@@ -696,8 +1000,15 @@ async function fetchChannelVideos(channelId, uploadsPlaylistId, key, settings, m
       pageToken = d.nextPageToken || '';
       if (!pageToken) break;
     }
+    playlistOk = true;
   } catch (e) { /* playlist may be empty/private — return what we have */ }
-  if (!videoIds.length) { if (cache) cache.videos.set(cacheKey, []); return []; }
+  if (!videoIds.length) {
+    if (cache) cache.videos.set(cacheKey, []);
+    // Only cache an empty list when the playlist read itself succeeded —
+    // a transient failure must not poison the cache for 24h.
+    if (playlistOk) ytCacheSet('videos', cacheKey, []);
+    return [];
+  }
   const chunks = [];
   for (let i = 0; i < videoIds.length; i += 50) chunks.push(videoIds.slice(i, i + 50));
   const results = await mapPool(chunks, async (chunk) => {
@@ -723,6 +1034,7 @@ async function fetchChannelVideos(channelId, uploadsPlaylistId, key, settings, m
   }, 4);
   const videos = results.flat();
   if (cache) cache.videos.set(cacheKey, videos);
+  ytCacheSet('videos', cacheKey, videos); // no-op in JSON mode
   return videos;
 }
 
@@ -1006,7 +1318,8 @@ app.get('/api/status', (req, res) => {
   // Quota display: shared quota + the caller's own token balance.
   const tokens = auth.loggedIn ? tokenState(auth.email) : null;
   res.json({
-    ok: true, hasKey: !!effectiveApiKey(s), quotaUsed: s.quotaUsed || 0, quotaLimit: QUOTA_LIMIT, quotaDate: s.quotaDate,
+    ok: true, version: APP_VERSION, storage: isDbMode() ? 'postgres' : 'json',
+    hasKey: !!effectiveApiKey(s), quotaUsed: s.quotaUsed || 0, quotaLimit: QUOTA_LIMIT, quotaDate: s.quotaDate,
     quotaRemaining: QUOTA_LIMIT - (s.quotaUsed || 0),
     searchUsed: s.searchUsed || 0, searchLimit: SEARCH_LIMIT,
     searchRemaining: SEARCH_LIMIT - (s.searchUsed || 0),
@@ -1027,7 +1340,8 @@ app.get('/api/diag', (req, res) => {
     stall: m.stall || null, createdAt: m.createdAt
   }));
   res.json({
-    ok: true, hasKey: !!effectiveApiKey(s), quotaUsed: s.quotaUsed || 0, quotaLimit: QUOTA_LIMIT, quotaDate: s.quotaDate,
+    ok: true, version: APP_VERSION, storage: isDbMode() ? 'postgres' : 'json',
+    hasKey: !!effectiveApiKey(s), quotaUsed: s.quotaUsed || 0, quotaLimit: QUOTA_LIMIT, quotaDate: s.quotaDate,
     searchUsed: s.searchUsed || 0, searchLimit: SEARCH_LIMIT,
     searchBlocked: isSearchBlockedToday(),
     lastYtError: lastYtErrors[0] || null, recentYtErrors: lastYtErrors, maps
@@ -1777,8 +2091,21 @@ app.post('/api/maps/:id/videos/:videoId/replicate', async (req, res) => {
 // cache (quota saving — no re-search on every click). Cache file:
 // data/trending.json (gitignored like the other data files).
 const TRENDING_FILE = path.join(DATA_DIR, 'trending.json');
-function getTrendingCache() { return loadJson(TRENDING_FILE, { runs: {} }).runs; }
-function saveTrendingCache(runs) { saveJson(TRENDING_FILE, { runs }); }
+function getTrendingCache() {
+  if (isDbMode()) { dbGuard(); return storeSnapshot.trending.runs; }
+  return loadJson(TRENDING_FILE, { runs: {} }).runs;
+}
+function saveTrendingCache(runs) {
+  if (isDbMode()) {
+    dbGuard();
+    storeSnapshot.trending = { runs };
+    for (const [k, rec] of Object.entries(runs)) {
+      dbQuery('INSERT INTO cs_trending (cache_key, data) VALUES ($1, $2) ON CONFLICT (cache_key) DO UPDATE SET data = EXCLUDED.data, as_of = now()', [k, rec]);
+    }
+    return;
+  }
+  saveJson(TRENDING_FILE, { runs });
+}
 const TRENDING_MIN_MEDIAN = 100; // same guard as breakouts: no numeric outlier below this
 const TRENDING_SEARCH_KEYWORDS = 3; // searches cost 100 units each — bound the run
 const TRENDING_PAGE_NOTE = 'Criteria signal: 1,000+ subscribers and 100,000+ views on the trending video — watch hours cannot be verified via the YouTube Data API, so this is the signal used.';
@@ -1922,7 +2249,7 @@ app.get('/api/trending', async (req, res) => {
     }
     return res.json({ ok: true, allowed: false, cached: false, niche: nicheLabel, keywords, asOf: new Date().toISOString(), quotaUsed: 0, count: 0, channels: [], note: ACCESS_NOTE + ' No cached trending data for this niche yet.' });
   }
-  if (hit && hit.date === today && req.query.refresh !== '1') {
+  if (hit && trendingCacheFresh(hit) && req.query.refresh !== '1') {
     return res.json({ ok: true, allowed: canSee, cached: true, niche: nicheLabel, keywords, asOf: hit.asOf, quotaUsed: hit.quotaUsed, count: hit.channels.length, channels: canSee ? hit.channels : hit.channels.map(maskTrendingChannel), note });
   }
   const settings = needKey(res);
@@ -2438,6 +2765,19 @@ function startServer(port, attemptsLeft) {
 }
 // Only auto-start when run directly (node server.js / pkg exe). Tests can
 // require() this file and use the exported helpers without starting a server.
-ensureAdminFromEnv();
-if (require.main === module) startServer(PORT, 5);
-module.exports = { app, tokenize, detectLangFamily, deriveNiche, nicheTest, median, ensureAdminFromEnv, getAuth, buildChannelIndex, vphOf, effectiveApiKey };
+// In DB mode initStore() must finish BEFORE the admin check and listen: it
+// loads the snapshot the admin check reads. If Postgres cannot be reached,
+// boot fails loudly instead of serving with an empty store.
+if (!isDbMode()) ensureAdminFromEnv();
+if (require.main === module) {
+  (async () => {
+    if (isDbMode()) {
+      try { await initStore(); }
+      catch (e) { console.error('Postgres store failed to initialise:', e.message); process.exit(1); }
+      ensureAdminFromEnv();
+    }
+    process.on('SIGTERM', async () => { await closeStore(); process.exit(0); });
+    startServer(PORT, 5);
+  })();
+}
+module.exports = { app, tokenize, detectLangFamily, deriveNiche, nicheTest, median, ensureAdminFromEnv, getAuth, buildChannelIndex, vphOf, effectiveApiKey, APP_VERSION, isDbMode, initStore, flushStoreWrites, closeStore, ytCacheGet, ytCacheSet, searchCacheGet, searchCacheSet, getSettings, getUsers, getMaps, getTrendingCache, saveTrendingCache, isSearchBlockedToday, markSearchBlocked, clearSearchBlocked, CHANNEL_TTL_MS, VIDEO_TTL_MS, TRENDING_TTL_MS, CACHE_TTLS };
